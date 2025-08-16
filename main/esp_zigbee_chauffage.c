@@ -25,58 +25,126 @@
 #include <stdlib.h>
 #include "esp_task_wdt.h"
 #include <inttypes.h>
+#include <esp_timer.h>
+#include "cJSON.h"
 
 static const char *TAG = "ESP_ZIGBEE_CHAUFFAGE";
 
-// Déclarations préalables
-static void esp_zb_task(void *pvParameters);
-static httpd_handle_t start_webserver(void);
-static void read_thermostat_attributes(void);
-static void write_thermostat_attributes(int16_t new_setpoint, uint16_t new_high_hyst, uint16_t new_low_hyst,
-                                       bool setpoint_updated, bool hysteresis_high_updated, bool hysteresis_low_updated);
-
-// Paramètres modifiables
+// Variables globales
 int16_t last_temperature = INT16_MIN;
-int16_t last_setpoint = INT16_MIN;
+int16_t last_humidity = INT16_MIN;
+int16_t last_setpoint = INT16_MIN; // Maintenu localement
 int16_t input_setpoint = INT16_MIN;
-uint16_t high_hysteresis = 0;
-uint16_t low_hysteresis = 0;
-uint16_t input_high_hyst = 10;
-uint16_t input_low_hyst = 10;
-uint8_t running_state = 3; // Nouvel état de fonctionnement du thermostat
+uint16_t input_high_hyst = 10; // 0.1°C par défaut
+uint16_t input_low_hyst = 10;  // 0.1°C par défaut
 static uint8_t relay_actual_state = 0xFF; // 0xFF = inconnu, 0 = OFF, 1 = ON
-static char *update_status = NULL; // Pour afficher l'état d'avancement de la commande
-static char *status = NULL; // Pour afficher le status de la commande
-static int current_write_attempt = 0;
+static char *update_status = NULL;
+static char *status = NULL;
 static uint8_t last_command_sent = 0xFF;
 
 static int s_retry_num = 0;
 static bool wifi_failed = false;
 static TaskHandle_t zb_task_handle = NULL;
 static bool first_request = true;
-static bool current_setpoint_update = false;
-static bool current_high_hyst_update = false;
-static bool current_low_hyst_update = false;
 
-// Variables pour la gestion des retries d'écriture
-static bool write_in_progress = false;
-static int write_attempts = 0;
+static bool update_status_allocated = false;
+
+// Variables pour la gestion des écritures
 static int16_t target_setpoint = INT16_MIN;
 static uint16_t target_high_hyst = 0;
 static uint16_t target_low_hyst = 0;
-static const int MAX_WRITE_ATTEMPTS = 5;
-static const TickType_t RETRY_DELAY_MS = 20000;
 
-typedef struct {
-    int16_t new_setpoint;
-    uint16_t new_high_hyst;
-    uint16_t new_low_hyst;
-    bool setpoint_updated;
-    bool hysteresis_high_updated;
-    bool hysteresis_low_updated;
-} write_thermostat_attributes_t;
+/* Compteur global pour les headers Lumi */
+static uint8_t lumi_counter = 0x10;
 
-// Fonctions existantes (simplifiées pour clarté, inchangées sauf si nécessaire)
+// Prototypes de fonctions
+static void esp_zb_task(void *pvParameters);
+static httpd_handle_t start_webserver(void);
+static void read_thermostat_attributes(void);
+static void read_relay_state(void);
+static void write_thermostat_attributes(int16_t new_setpoint, uint16_t new_high_hyst, uint16_t new_low_hyst,
+                                       bool setpoint_updated, bool hysteresis_high_updated, bool hysteresis_low_updated);
+static void set_sensor_mode(const char *mode);
+static void set_external_temperature(int16_t setpoint);
+static void set_external_humidity(uint8_t humidity_percent);
+static void save_settings_to_nvs(void);
+static void load_settings_from_nvs(void);
+static void send_on_off_command(uint8_t command_id);
+static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_message_t *message);
+static esp_err_t post_handler(httpd_req_t *req);
+static esp_err_t data_handler(httpd_req_t *req);
+static uint8_t construct_lumi_header(uint8_t *buffer, uint8_t counter, uint8_t cmd_len, uint8_t cmd_id);
+
+static void save_settings_to_nvs(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+
+    err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_set_i16(nvs_handle, "setpoint", last_setpoint);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save setpoint: %s", esp_err_to_name(err));
+    }
+
+    err = nvs_set_u16(nvs_handle, "high_hyst", input_high_hyst);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save high_hyst: %s", esp_err_to_name(err));
+    }
+
+    err = nvs_set_u16(nvs_handle, "low_hyst", input_low_hyst);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save low_hyst: %s", esp_err_to_name(err));
+    }
+
+    err = nvs_commit(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "Settings saved to NVS: setpoint=%d, high_hyst=%u, low_hyst=%u", 
+             last_setpoint, input_high_hyst, input_low_hyst);
+}
+
+static void load_settings_from_nvs(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+
+    err = nvs_open("storage", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS: %s, using default settings", esp_err_to_name(err));
+        last_setpoint = 1900; // 19.0°C
+        input_high_hyst = 10; // 0.1°C
+        input_low_hyst = 10;  // 0.1°C
+        return;
+    }
+
+    err = nvs_get_i16(nvs_handle, "setpoint", &last_setpoint);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read setpoint: %s, using default (1900)", esp_err_to_name(err));
+        last_setpoint = 1900;
+    }
+
+    err = nvs_get_u16(nvs_handle, "high_hyst", &input_high_hyst);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read high_hyst: %s, using default (10)", esp_err_to_name(err));
+        input_high_hyst = 10;
+    }
+
+    err = nvs_get_u16(nvs_handle, "low_hyst", &input_low_hyst);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read low_hyst: %s, using default (10)", esp_err_to_name(err));
+        input_low_hyst = 10;
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "Settings loaded from NVS: setpoint=%d, high_hyst=%u, low_hyst=%u", 
+             last_setpoint, input_high_hyst, input_low_hyst);
+}
 
 static void bdb_start_top_level_commissioning_wrapper(uint8_t mode_mask)
 {
@@ -97,7 +165,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         if (err_status == ESP_OK) {
             ESP_LOGI(TAG, "Joined Zigbee network successfully (PAN ID: 0x%04hx, Channel: %d, Short Address: 0x%04hx)",
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
+            set_sensor_mode("external");  /* Activer le mode external au démarrage */
             read_thermostat_attributes();
+            if (last_setpoint != INT16_MIN) {
+                ESP_LOGI(TAG, "Applying setpoint from NVS: %.1f °C", last_setpoint / 100.0);
+                set_external_temperature(last_setpoint);
+            }
         } else {
             ESP_LOGW(TAG, "Network %s failed with status: %s (0x%x)", esp_zb_zdo_signal_to_string(sig_type), esp_err_to_name(err_status), err_status);
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_wrapper, ESP_ZB_BDB_MODE_NETWORK_STEERING, 5000);
@@ -105,15 +178,29 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         break;
     case ESP_ZB_ZDO_DEVICE_UNAVAILABLE:
         ESP_LOGW(TAG, "ZDO Device Unavailable detected, status: %s (0x%x)", esp_err_to_name(err_status), err_status);
-        if (write_in_progress) {
-            write_in_progress = false;
-            ESP_LOGW(TAG, "Aborting write operation due to device unavailability");
-            if (update_status) {
-                free(update_status);
-                update_status = NULL;
-                status = "Échec de la mise à jour, périphérique indisponible";
-            }
+        if (update_status && update_status_allocated) {
+            ESP_LOGI(TAG, "Freeing update_status at address %p due to device unavailability", update_status);
+            free(update_status);
+            update_status = NULL;
+            update_status_allocated = false;
         }
+        asprintf(&update_status, "Échec de l'écriture, périphérique indisponible");
+        update_status_allocated = true;
+        esp_zb_zcl_read_attr_cmd_t read_cmd = {
+            .zcl_basic_cmd = {
+                .dst_addr_u.addr_short = THERMOSTAT,
+                .dst_endpoint = 1,
+                .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
+            },
+            .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+            .clusterID = 0xFCC0,
+            .manuf_specific = 1,
+            .manuf_code = MANUFACTURER_CODE,
+            .attr_number = 1,
+            .attr_field = (uint16_t[]){0x0172},
+        };
+        esp_zb_zcl_read_attr_cmd_req(&read_cmd);
+        ESP_LOGI(TAG, "Sent read request for mode attribute (0x0172)");
         break;
     default:
         ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s (0x%x)", 
@@ -124,7 +211,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 
 static void send_on_off_command(uint8_t command_id)
 {
-    if (command_id == last_command_sent && !write_in_progress) {
+    if (command_id == last_command_sent) {
         ESP_LOGI(TAG, "Skipping %s command to Shelly relay (0x%04x, endpoint %d): already in this state",
                  (command_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", RELAY_CHAUFF, RELAY_BINDING_EP);
         return;
@@ -150,6 +237,24 @@ static void send_on_off_command(uint8_t command_id)
     last_command_sent = command_id;
 }
 
+static void read_relay_state(void)
+{
+    esp_zb_zcl_read_attr_cmd_t read_cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = RELAY_CHAUFF,
+            .dst_endpoint = 1,
+            .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+        .manuf_specific = 0,
+        .attr_number = 1,
+        .attr_field = (uint16_t[]){0x0000},
+    };
+    esp_zb_zcl_read_attr_cmd_req(&read_cmd);
+    ESP_LOGI(TAG, "Sent read request for relay state (0x0000)");
+}
+
 static void read_thermostat_attributes(void)
 {
     // Lecture de la température locale
@@ -161,8 +266,8 @@ static void read_thermostat_attributes(void)
         },
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
         .clusterID = ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-        .manuf_specific = 1,
-        .manuf_code = 4447,
+        .manuf_specific = 0,
+        .manuf_code = MANUFACTURER_CODE,
         .attr_number = 1,
         .attr_field = (uint16_t[]){ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID},
     };
@@ -177,14 +282,14 @@ static void read_thermostat_attributes(void)
         },
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
         .clusterID = ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
-        .manuf_specific = 1,
-        .manuf_code = 4447,
+        .manuf_specific = 0,
+        .manuf_code = MANUFACTURER_CODE,
         .attr_number = 1,
         .attr_field = (uint16_t[]){ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID},
     };
     esp_zb_zcl_read_attr_cmd_req(&cmd_humidity);
 
-    // Lecture des attributs spécifiques (setpoint, hystérésis) sur cluster personnalisé
+    // Lecture du mode capteur
     esp_zb_zcl_read_attr_cmd_t cmd_specific = {
         .zcl_basic_cmd = {
             .dst_addr_u.addr_short = THERMOSTAT,
@@ -192,15 +297,11 @@ static void read_thermostat_attributes(void)
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
         .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
-        .clusterID = 0xFCC0, // manuSpecificLumi
+        .clusterID = 0xFCC0,
         .manuf_specific = 1,
-        .manuf_code = 4447,
-        .attr_number = 3,
-        .attr_field = (uint16_t[]){
-            0x0000, // lumiExternalSensor (setpoint)
-            0x0167, // high_temperature
-            0x0166  // low_temperature
-        },
+        .manuf_code = MANUFACTURER_CODE,
+        .attr_number = 1,
+        .attr_field = (uint16_t[]){0x0172}, // sensor
     };
     esp_zb_zcl_read_attr_cmd_req(&cmd_specific);
 
@@ -223,68 +324,34 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
         if (message->cluster == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID) {
                 last_temperature = *(int16_t *)message->attribute.data.value;
-                ESP_LOGI(TAG, "Thermostat 0x%04x Local Temperature: %d.%d °C", 
+                ESP_LOGI(TAG, "Thermostat 0x%04x Température: %d.%d °C", 
                          message->src_address.u.short_addr, 
                          last_temperature / 100, abs(last_temperature % 100));
             }
         } else if (message->cluster == ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID) {
-                uint16_t humidity = *(uint16_t *)message->attribute.data.value;
-                ESP_LOGI(TAG, "Thermostat 0x%04x Humidity: %d.%d %%", 
+                last_humidity = *(uint16_t *)message->attribute.data.value;
+                ESP_LOGI(TAG, "Thermostat 0x%04x Humidité: %d.%d %%", 
                          message->src_address.u.short_addr, 
-                         humidity / 100, abs(humidity % 100));
+                         last_humidity / 100, abs(last_humidity % 100));
             }
-        } else if (message->cluster == 0xFCC0) { // manuSpecificLumi
-            if (message->attribute.id == 0x0000) { // lumiExternalSensor
-                last_setpoint = *(int16_t *)message->attribute.data.value;
-                input_setpoint = last_setpoint;
-                ESP_LOGI(TAG, "Thermostat 0x%04x External Sensor Setpoint: %d.%d °C", 
-                         message->src_address.u.short_addr, 
-                         last_setpoint / 100, abs(last_setpoint % 100));
-                if (write_in_progress && current_setpoint_update && last_setpoint == target_setpoint) {
-                    write_in_progress = false;
-                    if (update_status) {
-                        free(update_status);
-                        update_status = NULL;
-                    }
-                    ESP_LOGI(TAG, "Write confirmed by attribute report for setpoint, stopping retries");
-                }
-            } else if (message->attribute.id == 0x0167) { // high_temperature
-                high_hysteresis = *(uint16_t *)message->attribute.data.value;
-                input_high_hyst = high_hysteresis;
-                ESP_LOGI(TAG, "Thermostat 0x%04x High Hysteresis: %d.%d °C", 
-                         message->src_address.u.short_addr, 
-                         high_hysteresis / 100, abs(high_hysteresis % 100));
-                if (write_in_progress && current_high_hyst_update && high_hysteresis == target_high_hyst) {
-                    write_in_progress = false;
-                    if (update_status) {
-                        free(update_status);
-                        update_status = NULL;
-                    }
-                    ESP_LOGI(TAG, "Write confirmed by attribute report for high hysteresis, stopping retries");
-                }
-            } else if (message->attribute.id == 0x0166) { // low_temperature
-                low_hysteresis = *(uint16_t *)message->attribute.data.value;
-                input_low_hyst = low_hysteresis;
-                ESP_LOGI(TAG, "Thermostat 0x%04x Low Hysteresis: %d.%d °C", 
-                         message->src_address.u.short_addr, 
-                         low_hysteresis / 100, abs(low_hysteresis % 100));
-                if (write_in_progress && current_low_hyst_update && low_hysteresis == target_low_hyst) {
-                    write_in_progress = false;
-                    if (update_status) {
-                        free(update_status);
-                        update_status = NULL;
-                    }
-                    ESP_LOGI(TAG, "Write confirmed by attribute report for low hysteresis, stopping retries");
-                }
+        } else if (message->cluster == 0xFCC0) {
+            if (message->attribute.id == 0x0172) {
+                uint8_t sensor_mode = *(uint8_t *)message->attribute.data.value;
+                const char *mode_str = (sensor_mode == 2 || sensor_mode == 3) ? "external" : "internal";
+                ESP_LOGI(TAG, "Thermostat 0x%04x Sensor mode: %s (raw: %u)", 
+                         message->src_address.u.short_addr, mode_str, sensor_mode);
             }
         }
 
+        // Logique du relais avec last_setpoint, input_high_hyst et input_low_hyst
         if (last_temperature != INT16_MIN && last_setpoint != INT16_MIN) {
-            if (last_temperature <= last_setpoint - (int16_t)low_hysteresis) {
+            if (last_temperature <= last_setpoint - (int16_t)input_low_hyst) {
                 send_on_off_command(ESP_ZB_ZCL_CMD_ON_OFF_ON_ID);
-            } else if (last_temperature >= last_setpoint + (int16_t)high_hysteresis) {
+                read_relay_state();
+            } else if (last_temperature >= last_setpoint + (int16_t)input_high_hyst) {
                 send_on_off_command(ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID);
+                read_relay_state();
             }
         }
     }
@@ -301,138 +368,57 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
     return ESP_OK;
 }
 
-static void write_task(void *pvParameters)
+static void reset_update_status_task(void *pvParameters)
 {
-    write_thermostat_attributes_t *params = (write_thermostat_attributes_t *)pvParameters;
-    write_thermostat_attributes(params->new_setpoint, params->new_high_hyst, params->new_low_hyst,
-                                params->setpoint_updated, params->hysteresis_high_updated, params->hysteresis_low_updated);
-    vPortFree(params);
+    vTaskDelay(pdMS_TO_TICKS(5000)); // Attendre 5 secondes
+    if (update_status && update_status_allocated) {
+        ESP_LOGI(TAG, "Freeing update_status at address %p after timeout", update_status);
+        free(update_status);
+        update_status = NULL;
+        update_status_allocated = false;
+    }
     vTaskDelete(NULL);
 }
 
 static void write_thermostat_attributes(int16_t new_setpoint, uint16_t new_high_hyst, uint16_t new_low_hyst,
                                        bool setpoint_updated, bool hysteresis_high_updated, bool hysteresis_low_updated)
 {
-    if (write_in_progress) {
-        ESP_LOGW(TAG, "Write already in progress, skipping new request");
-        return;
+    // Réinitialiser update_status
+    if (update_status && update_status_allocated) {
+        ESP_LOGI(TAG, "Freeing update_status at address %p", update_status);
+        free(update_status);
+        update_status = NULL;
+        update_status_allocated = false;
     }
 
-    write_in_progress = true;
-    write_attempts = 0;
-    current_write_attempt = 0;
-    target_setpoint = new_setpoint;
-    target_high_hyst = new_high_hyst;
-    target_low_hyst = new_low_hyst;
-
-    current_setpoint_update = setpoint_updated;
-    current_high_hyst_update = hysteresis_high_updated;
-    current_low_hyst_update = hysteresis_low_updated;
-
-    int attr_count = 0;
-    esp_zb_zcl_attribute_t attrs[3];
+    // Mettre à jour le setpoint via Zigbee si nécessaire
     if (setpoint_updated) {
-        attrs[attr_count].id = 0x0000; // lumiExternalSensor
-        attrs[attr_count].data.value = &new_setpoint;
-        attrs[attr_count].data.type = ESP_ZB_ZCL_ATTR_TYPE_S16;
-        attr_count++;
-    }
-    if (hysteresis_high_updated) {
-        attrs[attr_count].id = 0x0167; // high_temperature
-        attrs[attr_count].data.value = &new_high_hyst;
-        attrs[attr_count].data.type = ESP_ZB_ZCL_ATTR_TYPE_U16;
-        attr_count++;
-    }
-    if (hysteresis_low_updated) {
-        attrs[attr_count].id = 0x0166; // low_temperature
-        attrs[attr_count].data.value = &new_low_hyst;
-        attrs[attr_count].data.type = ESP_ZB_ZCL_ATTR_TYPE_U16;
-        attr_count++;
+        set_external_temperature(new_setpoint);
+        last_setpoint = new_setpoint; // Mettre à jour localement
+        save_settings_to_nvs(); // Sauvegarder dans NVS
+        asprintf(&update_status, "Setpoint modifié avec succès");
+        update_status_allocated = true;
+        ESP_LOGI(TAG, "Update status set to: %s", update_status);
+        xTaskCreate(reset_update_status_task, "Reset_Update_Status", 2048, NULL, 1, NULL);
     }
 
-    if (attr_count == 0) {
+    // Mettre à jour les hystérésis localement et dans NVS
+    if (hysteresis_high_updated) {
+        input_high_hyst = new_high_hyst; // Mettre à jour localement
+        save_settings_to_nvs(); // Sauvegarder dans NVS
+        ESP_LOGI(TAG, "High hysteresis updated locally: %.1f °C", input_high_hyst / 100.0);
+    }
+
+    if (hysteresis_low_updated) {
+        input_low_hyst = new_low_hyst; // Mettre à jour localement
+        save_settings_to_nvs(); // Sauvegarder dans NVS
+        ESP_LOGI(TAG, "Low hysteresis updated locally: %.1f °C", input_low_hyst / 100.0);
+    }
+
+    if (!setpoint_updated && !hysteresis_high_updated && !hysteresis_low_updated) {
         ESP_LOGW(TAG, "No attributes to write, skipping operation");
-        write_in_progress = false;
         return;
     }
-
-    if (update_status) {
-        free(update_status);
-        update_status = NULL;
-    }
-    if (status) {
-        free(status);
-        status = NULL;
-    }
-
-    while (write_attempts < MAX_WRITE_ATTEMPTS && write_in_progress) {
-        current_write_attempt = write_attempts + 1;
-        asprintf(&update_status, "Commande lancée %d/%d", current_write_attempt, MAX_WRITE_ATTEMPTS);
-        ESP_LOGI(TAG, "Update status set to: %s", update_status);
-
-        esp_zb_zcl_write_attr_cmd_t cmd = {
-            .zcl_basic_cmd = {
-                .dst_addr_u.addr_short = THERMOSTAT,
-                .dst_endpoint = 1,
-                .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
-            },
-            .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
-            .manuf_specific = 1,
-            .manuf_code = 4447,
-            .clusterID = 0xFCC0,
-            .attr_number = attr_count,
-            .attr_field = attrs,
-        };
-
-        ESP_LOGI(TAG, "Sending write request for %d attribute(s) (Attempt %d/%d) with manufacturerCode 0x%04x",
-                 attr_count, current_write_attempt, MAX_WRITE_ATTEMPTS, cmd.manuf_code);
-
-        esp_zb_lock_acquire(portMAX_DELAY);
-        esp_zb_zcl_write_attr_cmd_req(&cmd);
-        esp_zb_lock_release();
-
-        TickType_t wait_start = xTaskGetTickCount();
-        TickType_t waiting_start = xTaskGetTickCount();
-        TickType_t xFrequency = configTICK_RATE_HZ;
-        unsigned long total_time = RETRY_DELAY_MS / 1000;
-        unsigned long time_since_start = 0;
-        unsigned long remaining_time = 0;
-        while (write_in_progress && (xTaskGetTickCount() - wait_start) < (RETRY_DELAY_MS / portTICK_PERIOD_MS)) {
-            xTaskDelayUntil(&waiting_start, xFrequency);
-            if (update_status) {
-                char *temp_status;
-                time_since_start = (waiting_start - wait_start) / xFrequency;
-                remaining_time = total_time >= time_since_start ? total_time - time_since_start : 0;
-                asprintf(&temp_status, "Commande lancée %d/%d attente de réponse (%lus/%lus)",
-                         current_write_attempt, MAX_WRITE_ATTEMPTS, remaining_time, total_time);
-                free(update_status);
-                update_status = temp_status;
-                ESP_LOGI(TAG, "Update status updated to: %s", update_status);
-            }
-        }
-
-        write_attempts++;
-        if (!write_in_progress) {
-            break;
-        }
-    }
-
-    if (write_attempts >= MAX_WRITE_ATTEMPTS) {
-        ESP_LOGE(TAG, "Failed to write attributes after %d attempts", MAX_WRITE_ATTEMPTS);
-        asprintf(&status, "Dernière commande non aboutie après %d tentatives", MAX_WRITE_ATTEMPTS);
-    }
-
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-    read_thermostat_attributes();
-    if (update_status) {
-        free(update_status);
-        update_status = NULL;
-    }
-    write_in_progress = false;
-    current_setpoint_update = false;
-    current_high_hyst_update = false;
-    current_low_hyst_update = false;
-    ESP_LOGI(TAG, "Write process completed, write_in_progress reset to false");
 }
 
 static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message)
@@ -446,28 +432,68 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     {
         esp_zb_zcl_cmd_default_resp_message_t *resp = (esp_zb_zcl_cmd_default_resp_message_t *)message;
         ESP_LOGI(TAG, "Received ZCL Default Response from address(0x%04x) endpoint(%d) cluster(0x%04x) command(0x%02x) status(0x%02x)",
-                 resp->info.src_address.u.short_addr, resp->info.src_endpoint, resp->info.cluster, 
-                 resp->resp_to_cmd, resp->status_code);
+                resp->info.src_address.u.short_addr, resp->info.src_endpoint, resp->info.cluster, 
+                resp->resp_to_cmd, resp->status_code);
         if (resp->info.src_address.u.short_addr == THERMOSTAT && resp->info.cluster == 0xFCC0) {
             if (resp->status_code == 0) {
                 ESP_LOGI(TAG, "Write command to thermostat (0x%04x) succeeded", THERMOSTAT);
-                write_in_progress = false;
-                if (update_status) {
+                if (update_status && update_status_allocated) {
+                    ESP_LOGI(TAG, "Freeing update_status at address %p", update_status);
                     free(update_status);
                     update_status = NULL;
+                    update_status_allocated = false;
                 }
+                asprintf(&update_status, "Setpoint modifié avec succès");
+                update_status_allocated = true;
+                ESP_LOGI(TAG, "Update status set to: %s", update_status);
+                // Lancer la tâche pour réinitialiser update_status après 5 secondes
+                xTaskCreate(reset_update_status_task, "Reset_Update_Status", 2048, NULL, 1, NULL);
+                read_thermostat_attributes();
             } else {
                 ESP_LOGE(TAG, "Write failed for thermostat (0x%04x), status: 0x%02x", THERMOSTAT, resp->status_code);
-                asprintf(&status, "Échec de l'écriture, statut: 0x%02x", resp->status_code);
+                if (update_status && update_status_allocated) {
+                    ESP_LOGI(TAG, "Freeing update_status at address %p due to write failure", update_status);
+                    free(update_status);
+                    update_status = NULL;
+                    update_status_allocated = false;
+                }
+                asprintf(&update_status, "Échec de l'écriture, statut: 0x%02x", resp->status_code);
+                update_status_allocated = true;
+                // Lancer la tâche pour réinitialiser update_status après 5 secondes
+                xTaskCreate(reset_update_status_task, "Reset_Update_Status", 2048, NULL, 1, NULL);
+                read_thermostat_attributes();
             }
         } else if (resp->info.src_address.u.short_addr == RELAY_CHAUFF && resp->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
             ESP_LOGI(TAG, "Command %s (0x%02x) to Relay (0x%04x) %s",
-                     (resp->resp_to_cmd == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", resp->resp_to_cmd,
-                     RELAY_CHAUFF, (resp->status_code == 0) ? "succeeded" : "failed");
+                    (resp->resp_to_cmd == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", resp->resp_to_cmd,
+                    RELAY_CHAUFF, (resp->status_code == 0) ? "succeeded" : "failed");
         }
         break;
     }
-    
+    case ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID:
+    {
+        esp_zb_zcl_cmd_read_attr_resp_message_t *resp = (esp_zb_zcl_cmd_read_attr_resp_message_t *)message;
+        ESP_LOGI(TAG, "Received Read Attribute Response from address(0x%04x) endpoint(%d) cluster(0x%04x)",
+                resp->info.src_address.u.short_addr, resp->info.src_endpoint, resp->info.cluster);
+        esp_zb_zcl_read_attr_resp_variable_t *variable = resp->variables;
+        while (variable != NULL) {
+            if (variable->status == ESP_ZB_ZCL_STATUS_SUCCESS) {
+                if (resp->info.cluster == 0xFCC0 && variable->attribute.id == 0x0172) {
+                    uint8_t mode = *(uint8_t *)variable->attribute.data.value;
+                    ESP_LOGI(TAG, "Read mode attribute (0x0172, cluster 0xFCC0): %d", mode);
+                    if (mode == 0x02 || mode == 0x03) {
+                        ESP_LOGI(TAG, "Thermostat in external sensor mode");
+                    } else {
+                        ESP_LOGW(TAG, "Thermostat not in external sensor mode (mode=%d)", mode);
+                    }
+                }
+            } else {
+                ESP_LOGW(TAG, "Attribute 0x%04x read failed with status 0x%02x", variable->attribute.id, variable->status);
+            }
+            variable = variable->next;
+        }
+        break;
+    }
     default:
         ESP_LOGW(TAG, "Received Zigbee action(0x%x) callback", callback_id);
         break;
@@ -590,8 +616,8 @@ static void wifi_init(void)
 
 static esp_err_t get_handler(httpd_req_t *req)
 {
-    ESP_LOGI(TAG, "Received request: URI=%s, Content-Length=%d, last_temperature=%d",
-             req->uri, req->content_len, last_temperature);
+    ESP_LOGI(TAG, "Received request: URI=%s, Content-Length=%d, last_temperature=%d, last_humidity=%d",
+             req->uri, req->content_len, last_temperature, last_humidity);
 
     FILE *f = fopen("/spiffs/index.html", "r");
     if (f == NULL) {
@@ -642,15 +668,15 @@ static esp_err_t get_handler(httpd_req_t *req)
 
     first_request = true;
 
-    char temp_str[16], setpoint_str[16], relay_str[4], running_state_str[5];
+    char temp_str[16], humi_str[16], setpoint_str[16], relay_str[4], running_state_str[5];
     snprintf(temp_str, sizeof(temp_str), "%.1f", last_temperature != INT16_MIN ? last_temperature / 100.0 : 0.0);
+    snprintf(humi_str, sizeof(humi_str), "%.1f", last_humidity != INT16_MIN ? last_humidity / 100.0 : 0.0);
     snprintf(setpoint_str, sizeof(setpoint_str), "%.1f", last_setpoint != INT16_MIN ? last_setpoint / 100.0 : 0.0);
     snprintf(relay_str, sizeof(relay_str), "%s", last_command_sent == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID ? "ON" : "OFF");
-    snprintf(running_state_str, sizeof(running_state_str), "%s", running_state == 3 ? "N/A" : running_state == 1 ? "heat" : "idle");
 
     int res_len = snprintf(updated_response, 20000,
                            response,
-                           temp_str, setpoint_str, relay_str, running_state_str, setpoint_str);
+                           temp_str, humi_str, setpoint_str, relay_str, running_state_str, setpoint_str);
     if (res_len >= 20000) {
         ESP_LOGE(TAG, "Buffer overflow in get_handler, response truncated, res_len=%d", res_len);
         free(response);
@@ -666,6 +692,52 @@ static esp_err_t get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t favicon_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Received request for favicon: URI=%s", req->uri);
+
+    FILE *f = fopen("/spiffs/favicon.ico", "r");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open favicon.ico");
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    rewind(f);
+    ESP_LOGI(TAG, "Favicon.ico size: %ld bytes", file_size);
+    if (file_size > 10000) {
+        ESP_LOGE(TAG, "Favicon.ico too large (%" PRId32 " bytes), max is 10000 bytes", (int32_t)file_size);
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    char *response = (char *)calloc(file_size + 1, 1);
+    if (response == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for favicon response");
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    size_t len = fread(response, 1, file_size, f);
+    fclose(f);
+    if (len <= 0) {
+        ESP_LOGE(TAG, "Failed to read favicon.ico");
+        free(response);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "image/x-icon");
+    httpd_resp_send(req, response, len);
+    free(response);
+    return ESP_OK;
+}
+
+/* Fonction pour gérer les requêtes POST */
 static esp_err_t post_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "Received POST request: URI=%s, Content-Length=%d", req->uri, req->content_len);
@@ -685,10 +757,21 @@ static esp_err_t post_handler(httpd_req_t *req)
         remaining -= ret;
     }
 
-    char setpoint_str[16];
-    int16_t new_setpoint = last_setpoint;
+    // Réinitialiser update_status avant de traiter la nouvelle requête
+    if (update_status && update_status_allocated) {
+        ESP_LOGI(TAG, "Freeing update_status at address %p before new POST", update_status);
+        free(update_status);
+        update_status = NULL;
+        update_status_allocated = false;
+    }
 
+    char setpoint_str[16], high_hyst_str[16], low_hyst_str[16];
+    int16_t new_setpoint = last_setpoint;
+    uint16_t new_high_hyst = input_high_hyst;
+    uint16_t new_low_hyst = input_low_hyst;
     bool setpoint_updated = false;
+    bool hysteresis_high_updated = false;
+    bool hysteresis_low_updated = false;
 
     if (httpd_query_key_value(buf, "setpoint", setpoint_str, sizeof(setpoint_str)) == ESP_OK) {
         new_setpoint = (int16_t)(atof(setpoint_str) * 100 + 0.05);
@@ -696,34 +779,62 @@ static esp_err_t post_handler(httpd_req_t *req)
         setpoint_updated = true;
     }
 
-    if (setpoint_updated) {
-        write_thermostat_attributes_t *params = (write_thermostat_attributes_t *)pvPortMalloc(sizeof(write_thermostat_attributes_t));
-        if (params) {
-            params->new_setpoint = new_setpoint;
-            params->new_high_hyst = high_hysteresis;
-            params->new_low_hyst = low_hysteresis;
-            params->setpoint_updated = setpoint_updated;
-            params->hysteresis_high_updated = false;
-            params->hysteresis_low_updated = false;
-            xTaskCreate(write_task, "Write_Task", 4096, params, 2, NULL);
-        } else {
-            ESP_LOGE(TAG, "Failed to allocate memory for write task parameters");
-        }
+    if (httpd_query_key_value(buf, "high_hyst", high_hyst_str, sizeof(high_hyst_str)) == ESP_OK) {
+        new_high_hyst = (uint16_t)(atof(high_hyst_str) * 100 + 0.05);
+        ESP_LOGI(TAG, "New high hysteresis received: %.1f °C, stored as %u", atof(high_hyst_str), new_high_hyst);
+        hysteresis_high_updated = true;
     }
 
-    char temp_str[16], setpoint_str_resp[16], relay_actual_str[16], relay_commanded_str[16], running_state_str[16];
+    if (httpd_query_key_value(buf, "low_hyst", low_hyst_str, sizeof(low_hyst_str)) == ESP_OK) {
+        new_low_hyst = (uint16_t)(atof(low_hyst_str) * 100 + 0.05);
+        ESP_LOGI(TAG, "New low hysteresis received: %.1f °C, stored as %u", atof(low_hyst_str), new_low_hyst);
+        hysteresis_low_updated = true;
+    }
+
+    // Exécuter write_thermostat_attributes directement
+    if (setpoint_updated || hysteresis_high_updated || hysteresis_low_updated) {
+        write_thermostat_attributes(
+            new_setpoint,
+            new_high_hyst,
+            new_low_hyst,
+            setpoint_updated,
+            hysteresis_high_updated,
+            hysteresis_low_updated
+        );
+    }
+
+    char temp_str[16], humi_str[16], setpoint_str_resp[16], relay_actual_str[16], relay_commanded_str[16];
+    char high_hyst_str_resp[16], low_hyst_str_resp[16];
     snprintf(temp_str, sizeof(temp_str), "%.1f", last_temperature != INT16_MIN ? last_temperature / 100.0 : 0.0);
-    snprintf(setpoint_str_resp, sizeof(setpoint_str_resp), "%.1f", last_setpoint != INT16_MIN ? last_setpoint / 100.0 : 0.0);
+    snprintf(humi_str, sizeof(humi_str), "%.1f", last_humidity != INT16_MIN ? last_humidity / 100.0 : 0.0);
+    snprintf(setpoint_str_resp, sizeof(setpoint_str_resp), "%.1f", new_setpoint != INT16_MIN ? new_setpoint / 100.0 : 0.0);
     snprintf(relay_actual_str, sizeof(relay_actual_str), "%s", (relay_actual_state != 0xFF) ? 
              ((relay_actual_state == 1) ? "ON" : "OFF") : "N/A");
     snprintf(relay_commanded_str, sizeof(relay_commanded_str), "%s", (last_command_sent != 0xFF) ? 
              ((last_command_sent == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF") : "N/A");
-    snprintf(running_state_str, sizeof(running_state_str), "%s", running_state == 3 ? "N/A" : running_state == 1 ? "heat" : "idle");
+    snprintf(high_hyst_str_resp, sizeof(high_hyst_str_resp), "%.1f", new_high_hyst != 0 ? new_high_hyst / 100.0 : 0.0);
+    snprintf(low_hyst_str_resp, sizeof(low_hyst_str_resp), "%.1f", new_low_hyst != 0 ? new_low_hyst / 100.0 : 0.0);
 
-    char *json_response = NULL;
-    int res_len = asprintf(&json_response, "{\"temperature\":\"%s\",\"setpoint\":\"%s\",\"relay_actual\":\"%s\",\"relay_commanded\":\"%s\",\"running\":\"%s\",\"update_status\":\"%s\"}",
-                           temp_str, setpoint_str_resp, relay_actual_str, relay_commanded_str, running_state_str, update_status ? update_status : "");
-    if (res_len < 0 || json_response == NULL) {
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        ESP_LOGE(TAG, "Failed to create JSON object");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    cJSON_AddStringToObject(root, "temperature", temp_str);
+    cJSON_AddStringToObject(root, "humidity", humi_str);
+    cJSON_AddStringToObject(root, "setpoint", setpoint_str_resp);
+    cJSON_AddStringToObject(root, "relay_actual", relay_actual_str);
+    cJSON_AddStringToObject(root, "relay_commanded", relay_commanded_str);
+    cJSON_AddStringToObject(root, "update_status", update_status ? update_status : "");
+    cJSON_AddStringToObject(root, "high_hyst", high_hyst_str_resp);
+    cJSON_AddStringToObject(root, "low_hyst", low_hyst_str_resp);
+
+    char *json_response = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!json_response) {
         ESP_LOGE(TAG, "Failed to allocate JSON response");
         httpd_resp_send_500(req);
         return ESP_FAIL;
@@ -740,18 +851,22 @@ static esp_err_t post_handler(httpd_req_t *req)
 static esp_err_t data_handler(httpd_req_t *req)
 {
     static int16_t last_temperature_sent = INT16_MIN;
+    static int16_t last_humidity_sent = INT16_MIN;
     static int16_t last_setpoint_sent = INT16_MIN;
     static uint8_t last_relay_actual_state_sent = 0xFF;
-    static uint8_t last_running_state_sent = 0;
+    static uint16_t last_high_hyst_sent = 0;
+    static uint16_t last_low_hyst_sent = 0;
     static char *last_update_status_sent = NULL;
 
     bool data_changed = false;
 
     if (first_request || 
         last_temperature_sent != last_temperature ||
+        last_humidity_sent != last_humidity ||
         last_setpoint_sent != last_setpoint ||
         last_relay_actual_state_sent != relay_actual_state ||
-        last_running_state_sent != running_state ||
+        last_high_hyst_sent != input_high_hyst ||
+        last_low_hyst_sent != input_low_hyst ||
         (update_status && !last_update_status_sent) ||
         (!update_status && last_update_status_sent) ||
         (update_status && last_update_status_sent && strcmp(update_status, last_update_status_sent) != 0)) {
@@ -765,22 +880,24 @@ static esp_err_t data_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    char temp_str[16], setpoint_str[16], relay_actual_str[16], relay_commanded_str[16], running_state_str[16];
+    char temp_str[16], humi_str[16], setpoint_str[16], relay_actual_str[16], relay_commanded_str[16], high_hyst_str[16], low_hyst_str[16];
     snprintf(temp_str, sizeof(temp_str), "%.1f", last_temperature != INT16_MIN ? last_temperature / 100.0 : 0.0);
+    snprintf(humi_str, sizeof(temp_str), "%.1f", last_humidity != INT16_MIN ? last_humidity / 100.0 : 0.0);
     snprintf(setpoint_str, sizeof(setpoint_str), "%.1f", last_setpoint != INT16_MIN ? last_setpoint / 100.0 : 0.0);
     snprintf(relay_actual_str, sizeof(relay_actual_str), "%s", (relay_actual_state != 0xFF) ? 
              ((relay_actual_state == 1) ? "ON" : "OFF") : "N/A");
     snprintf(relay_commanded_str, sizeof(relay_commanded_str), "%s", (last_command_sent != 0xFF) ? 
              ((last_command_sent == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF") : "N/A");
-    snprintf(running_state_str, sizeof(running_state_str), "%s", running_state == 3 ? "N/A" : running_state == 1 ? "heat" : "idle");
+    snprintf(high_hyst_str, sizeof(high_hyst_str), "%.1f", input_high_hyst / 100.0);
+    snprintf(low_hyst_str, sizeof(low_hyst_str), "%.1f", input_low_hyst / 100.0);
 
     char *json_response = NULL;
-    int res_len = asprintf(&json_response, "{\"temperature\":\"%s\",\"setpoint\":\"%s\",\"relay_actual\":\"%s\",\"relay_commanded\":\"%s\",\"running\":\"%s\",\"update_status\":\"%s\"}",
-                           temp_str, setpoint_str, relay_actual_str, relay_commanded_str, running_state_str, update_status ? update_status : "");
+    int res_len = asprintf(&json_response, "{\"temperature\":\"%s\",\"humidity\":\"%s\",\"setpoint\":\"%s\",\"relay_actual\":\"%s\",\"relay_commanded\":\"%s\",\"high_hyst\":\"%s\",\"low_hyst\":\"%s\",\"update_status\":\"%s\"}",
+                           temp_str, humi_str, setpoint_str, relay_actual_str, relay_commanded_str, high_hyst_str, low_hyst_str, update_status ? update_status : "");
     if (res_len < 0 || json_response == NULL) {
         ESP_LOGE(TAG, "Failed to allocate JSON response, sending default JSON");
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"error\":\"Failed to generate JSON\",\"temperature\":\"0.0\",\"setpoint\":\"0.0\",\"relay_actual\":\"N/A\",\"relay_commanded\":\"N/A\",\"running\":\"N/A\",\"update_status\":\"\"}", 139);
+        httpd_resp_send(req, "{\"error\":\"Failed to generate JSON\",\"temperature\":\"0.0\",\"humidity\":\"0.0\",\"setpoint\":\"0.0\",\"relay_actual\":\"N/A\",\"relay_commanded\":\"N/A\",\"high_hyst\":\"0.1\",\"low_hyst\":\"0.1\",\"update_status\":\"\"}", 139);
         return ESP_OK;
     }
 
@@ -788,9 +905,11 @@ static esp_err_t data_handler(httpd_req_t *req)
     httpd_resp_send(req, json_response, strlen(json_response));
     
     last_temperature_sent = last_temperature;
+    last_humidity_sent = last_humidity;
     last_setpoint_sent = last_setpoint;
     last_relay_actual_state_sent = relay_actual_state;
-    last_running_state_sent = running_state;
+    last_high_hyst_sent = input_high_hyst;
+    last_low_hyst_sent = input_low_hyst;
     if (last_update_status_sent) free(last_update_status_sent);
     last_update_status_sent = update_status ? strdup(update_status) : NULL;
     first_request = false;
@@ -846,6 +965,12 @@ static httpd_handle_t start_webserver(void)
             .handler = get_handler,
             .user_ctx = NULL
         };
+        httpd_uri_t favicon_uri = {
+            .uri = "/favicon.ico",
+            .method = HTTP_GET,
+            .handler = favicon_handler,
+            .user_ctx = NULL
+        };
         httpd_uri_t post_uri = {
             .uri = "/update",
             .method = HTTP_POST,
@@ -866,6 +991,7 @@ static httpd_handle_t start_webserver(void)
         };
 
         httpd_register_uri_handler(server, &get_uri);
+        httpd_register_uri_handler(server, &favicon_uri);
         httpd_register_uri_handler(server, &post_uri);
         httpd_register_uri_handler(server, &data_uri);
         httpd_register_uri_handler(server, &status_uri);
@@ -946,6 +1072,294 @@ static void esp_zb_task(void *pvParameters)
     }
 }
 
+/* Fonction pour construire le header Lumi */
+static uint8_t construct_lumi_header(uint8_t *header, uint8_t counter, uint8_t params_length, uint8_t action) {
+    header[0] = 0xAA;
+    header[1] = 0x71;
+    header[2] = params_length + 3;
+    header[3] = 0x44;
+    header[4] = counter;
+    int sum = header[0] + header[1] + header[2] + header[3] + header[4];
+    header[5] = 512 - sum;
+    header[6] = action;
+    header[7] = 0x41;
+    header[8] = params_length;
+    return 9;  /* Taille du header */
+}
+
+/* Fonction pour définir le mode du capteur (internal ou external) */
+static void set_sensor_mode(const char *mode) {
+    bool is_external = (strcmp(mode, "external") == 0);
+    uint8_t action = is_external ? 0x02 : 0x04;
+
+    /* Timestamp BE (uptime en secondes) */
+    uint64_t us = esp_timer_get_time();
+    uint32_t sec = (uint32_t)(us / 1000000);
+    uint8_t timestamp[4] = { (sec >> 24) & 0xFF, (sec >> 16) & 0xFF, (sec >> 8) & 0xFF, sec & 0xFF };
+
+    uint8_t device_ieee[8] = THERMOSTAT_IEEE;
+    uint8_t fictive_sensor[8] = {0x00, 0x15, 0x8D, 0x00, 0x01, 0x9D, 0x1B, 0x98};
+    uint8_t chinese_humi[6] = {0xE6, 0xB9, 0xBF, 0xE5, 0xBA, 0xA6};  /* "湿度" */
+    uint8_t chinese_temp[6] = {0xE6, 0xB8, 0xA9, 0xE5, 0xBA, 0xA6};  /* "温度" */
+
+    /* Params pour humidity (0x15) */
+    uint8_t params_humi[4 + 1 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 + 5 + 1 + 1 + 1 + 1];  /* Max size 45 */
+    int idx = 0;
+    memcpy(params_humi + idx, timestamp, 4); idx += 4;
+    params_humi[idx++] = 0x15;
+    memcpy(params_humi + idx, device_ieee, 8); idx += 8;
+    if (is_external) {
+        memcpy(params_humi + idx, fictive_sensor, 8); idx += 8;
+        params_humi[idx++] = 0x00;
+        params_humi[idx++] = 0x02;
+        params_humi[idx++] = 0x00;
+        params_humi[idx++] = 0x55;
+        params_humi[idx++] = 0x15;
+        params_humi[idx++] = 0x0A;
+        params_humi[idx++] = 0x01;
+        params_humi[idx++] = 0x00;
+        params_humi[idx++] = 0x00;
+        params_humi[idx++] = 0x01;
+        params_humi[idx++] = 0x06;
+        memcpy(params_humi + idx, chinese_humi, 6); idx += 6;
+        memset(params_humi + idx, 0x00, 5); idx += 5;
+        params_humi[idx++] = 0x01;
+        params_humi[idx++] = 0x02;
+        params_humi[idx++] = 0x08;
+        params_humi[idx++] = 0x65;
+    } else {
+        memset(params_humi + idx, 0x00, 12); idx += 12;
+    }
+    uint8_t params_humi_len = idx;
+
+    /* Construire val pour humi */
+    uint8_t header[9];
+    uint8_t header_len = construct_lumi_header(header, lumi_counter++, params_humi_len, action);
+    uint8_t val_humi[header_len + params_humi_len];
+    memcpy(val_humi, header, header_len);
+    memcpy(val_humi + header_len, params_humi, params_humi_len);
+
+    /* Préparer l'attribut octet string (length + data) */
+    uint8_t attr_buf_humi[1 + sizeof(val_humi)];
+    attr_buf_humi[0] = sizeof(val_humi);
+    memcpy(attr_buf_humi + 1, val_humi, attr_buf_humi[0]);
+
+    esp_zb_zcl_attribute_t attr = {
+        .id = 0xFFF2,
+        .data.type = ESP_ZB_ZCL_ATTR_TYPE_OCTET_STRING,
+        .data.value = attr_buf_humi
+    };
+
+    esp_zb_zcl_write_attr_cmd_t cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_endpoint = 1,
+            .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = 0xFCC0,
+        .manuf_specific = 1,
+        .manuf_code = MANUFACTURER_CODE,
+        .attr_number = 1,
+        .attr_field = &attr,
+    };
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_write_attr_cmd_req(&cmd);
+    esp_zb_lock_release();
+
+    /* Params pour temperature (0x14) - similaire */
+    uint8_t params_temp[4 + 1 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 + 5 + 1 + 1 + 1 + 1];
+    idx = 0;
+    memcpy(params_temp + idx, timestamp, 4); idx += 4;
+    params_temp[idx++] = 0x14;
+    memcpy(params_temp + idx, device_ieee, 8); idx += 8;
+    if (is_external) {
+        memcpy(params_temp + idx, fictive_sensor, 8); idx += 8;
+        params_temp[idx++] = 0x00;
+        params_temp[idx++] = 0x01;
+        params_temp[idx++] = 0x00;
+        params_temp[idx++] = 0x55;
+        params_temp[idx++] = 0x15;
+        params_temp[idx++] = 0x0A;
+        params_temp[idx++] = 0x01;
+        params_temp[idx++] = 0x00;
+        params_temp[idx++] = 0x00;
+        params_temp[idx++] = 0x01;
+        params_temp[idx++] = 0x06;
+        memcpy(params_temp + idx, chinese_temp, 6); idx += 6;
+        memset(params_temp + idx, 0x00, 5); idx += 5;
+        params_temp[idx++] = 0x01;
+        params_temp[idx++] = 0x02;
+        params_temp[idx++] = 0x07;
+        params_temp[idx++] = 0x63;
+    } else {
+        memset(params_temp + idx, 0x00, 12); idx += 12;
+    }
+    uint8_t params_temp_len = idx;
+
+    /* Construire val pour temp */
+    header_len = construct_lumi_header(header, lumi_counter++, params_temp_len, action);
+    uint8_t val_temp[header_len + params_temp_len];
+    memcpy(val_temp, header, header_len);
+    memcpy(val_temp + header_len, params_temp, params_temp_len);
+
+    uint8_t attr_buf_temp[1 + sizeof(val_temp)];
+    attr_buf_temp[0] = sizeof(val_temp);
+    memcpy(attr_buf_temp + 1, val_temp, attr_buf_temp[0]);
+
+    attr.data.value = attr_buf_temp;
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_write_attr_cmd_req(&cmd);
+    esp_zb_lock_release();
+
+    /* Lire le mode pour confirmation */
+    esp_zb_zcl_read_attr_cmd_t read_cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_endpoint = 1,
+            .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = 0xFCC0,
+        .manuf_specific = 1,
+        .manuf_code = MANUFACTURER_CODE,
+        .attr_number = 1,
+        .attr_field = (uint16_t[]){0x0172},
+    };
+    esp_zb_zcl_read_attr_cmd_req(&read_cmd);
+
+    ESP_LOGI(TAG, "Mode sensor défini sur %s", mode);
+}
+
+/* Fonction pour définir external_temperature (= setpoint) */
+static void set_external_temperature(int16_t setpoint)
+{
+    uint8_t fictive_sensor[8] = {0x00, 0x15, 0x8D, 0x00, 0x01, 0x9D, 0x1B, 0x98};
+
+    /* Préparer le buffer float BE (setpoint est déjà en centièmes, e.g. 1900 pour 19.0°C) */
+    float f = (float)setpoint;
+    union { float fl; uint32_t u; } fu;
+    fu.fl = f;
+    uint8_t temp_buf[4] = { (fu.u >> 24) & 0xFF, (fu.u >> 16) & 0xFF, (fu.u >> 8) & 0xFF, fu.u & 0xFF };
+    ESP_LOGI(TAG, "Setpoint float value: %.2f, encoded as: %02x %02x %02x %02x", 
+             f, temp_buf[0], temp_buf[1], temp_buf[2], temp_buf[3]);
+
+    /* Params */
+    uint8_t params[8 + 1 + 1 + 1 + 1 + 4];  /* Size 16 */
+    int idx = 0;
+    memcpy(params + idx, fictive_sensor, 8); idx += 8;
+    params[idx++] = 0x00;
+    params[idx++] = 0x01;  /* 0x01 pour température */
+    params[idx++] = 0x00;
+    params[idx++] = 0x55;
+    memcpy(params + idx, temp_buf, 4); idx += 4;
+    uint8_t params_len = idx;
+
+    /* Construire val */
+    uint8_t header[9];
+    uint8_t header_len = construct_lumi_header(header, lumi_counter++, params_len, 0x05);
+    uint8_t val[header_len + params_len];
+    memcpy(val, header, header_len);
+    memcpy(val + header_len, params, params_len);
+
+    /* Log du buffer envoyé */
+    ESP_LOG_BUFFER_HEX(TAG, val, sizeof(val));
+
+    /* Attribut octet string */
+    uint8_t attr_buf[1 + sizeof(val)];
+    attr_buf[0] = sizeof(val);
+    memcpy(attr_buf + 1, val, attr_buf[0]);
+
+    esp_zb_zcl_attribute_t attr = {
+        .id = 0xFFF2,
+        .data.type = ESP_ZB_ZCL_ATTR_TYPE_OCTET_STRING,
+        .data.value = attr_buf
+    };
+
+    esp_zb_zcl_write_attr_cmd_t cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_endpoint = 1,
+            .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = 0xFCC0,
+        .manuf_specific = 1,
+        .manuf_code = MANUFACTURER_CODE,
+        .attr_number = 1,
+        .attr_field = &attr,
+    };
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_write_attr_cmd_req(&cmd);
+    esp_zb_lock_release();
+
+    ESP_LOGI(TAG, "External temperature (setpoint) défini sur %d.%d °C, TSN unknown", setpoint / 100, abs(setpoint % 100));
+}
+
+/* Fonction pour définir external_humidity (% batterie, à implémenter plus tard) */
+static void set_external_humidity(uint8_t battery_percent) {
+    uint8_t fictive_sensor[8] = {0x00, 0x15, 0x8D, 0x00, 0x01, 0x9D, 0x1B, 0x98};
+
+    float f = (float)battery_percent;
+    union { float fl; uint32_t u; } fu;
+    fu.fl = f;
+    uint8_t humi_buf[4] = { (fu.u >> 24) & 0xFF, (fu.u >> 16) & 0xFF, (fu.u >> 8) & 0xFF, fu.u & 0xFF };
+    ESP_LOGI(TAG, "Setpoint batterie value: %.2f, encoded as: %02x %02x %02x %02x", 
+             f, humi_buf[0], humi_buf[1], humi_buf[2], humi_buf[3]);
+
+    /* Params */
+    uint8_t params[8 + 1 + 1 + 1 + 1 + 4];
+    int idx = 0;
+    memcpy(params + idx, fictive_sensor, 8); idx += 8;
+    params[idx++] = 0x00;
+    params[idx++] = 0x02;  /* 0x02 pour humidity */
+    params[idx++] = 0x00;
+    params[idx++] = 0x55;
+    memcpy(params + idx, humi_buf, 4); idx += 4;
+    uint8_t params_len = idx;
+
+    /* Construire val */
+    uint8_t header[9];
+    uint8_t header_len = construct_lumi_header(header, lumi_counter++, params_len, 0x05);
+    uint8_t val[header_len + params_len];
+    memcpy(val, header, header_len);
+    memcpy(val + header_len, params, params_len);
+
+    /* Attribut octet string */
+    uint8_t attr_buf[1 + sizeof(val)];
+    attr_buf[0] = sizeof(val);
+    memcpy(attr_buf + 1, val, attr_buf[0]);
+
+    esp_zb_zcl_attribute_t attr = {
+        .id = 0xFFF2,
+        .data.type = ESP_ZB_ZCL_ATTR_TYPE_OCTET_STRING,
+        .data.value = attr_buf
+    };
+
+    esp_zb_zcl_write_attr_cmd_t cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_endpoint = 1,
+            .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = 0xFCC0,
+        .manuf_specific = 1,
+        .manuf_code = MANUFACTURER_CODE,
+        .attr_number = 1,
+        .attr_field = &attr,
+    };
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_write_attr_cmd_req(&cmd);
+    esp_zb_lock_release();
+
+    ESP_LOGI(TAG, "External temperature (setpoint) défini sur %d.%d °C, TSN unknown", battery_percent / 100, abs(battery_percent % 100));
+}
+
 void watchdog_task(void *pvParameters)
 {
     esp_task_wdt_config_t twdt_config = {
@@ -960,13 +1374,12 @@ void watchdog_task(void *pvParameters)
     while (1) {
         watchdog_counter++;
         total_seconds++;
-        if (watchdog_counter >= 100) {
+        if (watchdog_counter >= 120) {
             int jours = total_seconds / 86400;
             int heures = (total_seconds % 86400) / 3600;
             int minutes = (total_seconds % 3600) / 60;
-            int secondes = total_seconds % 60;
             watchdog_counter = 0;
-            ESP_LOGW("WATCHDOG", "Je nourris le chien depuis %dj %02dh %02dm %02ds", jours, heures, minutes, secondes);
+            ESP_LOGW("WATCHDOG", "Je nourris le chien depuis %dj %02dh %02dm", jours, heures, minutes);
         }
         esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -980,6 +1393,7 @@ void app_main(void)
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
     };
     ESP_ERROR_CHECK(nvs_flash_init());
+    load_settings_from_nvs(); // Charger les paramètres au démarrage
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
     wifi_init();
     xTaskCreate(watchdog_task, "watchdog_task", 2048, NULL, 1, NULL);
