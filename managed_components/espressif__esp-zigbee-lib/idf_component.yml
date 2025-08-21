@@ -4,7 +4,7 @@ dependencies:
 description: esp-zigbee library component
 repository: git://github.com/espressif/esp-zigbee-sdk.git
 repository_info:
-  commit_sha: 735b9a72a4174d5465e20f3cc2c5389a6633927f
+  commit_sha: f0cbffef8d6ab140b08a38fa67592649562c8d9d
   path: components/esp-zigbee-lib
 url: https://github.com/espressif/esp-zigbee-sdk
-version: 1.6.5
+version: 1.6.6

@@ -14,6 +14,7 @@
     "--compile-commands-dir=c:\\Users\\alain\\esp-zigbee-sdk\\examples\\esp_zigbee_customized_devices\\customized_client\\build"
   ],
   "files.associations": {
-    "esp_zigbee_core.h": "c"
+    "esp_zigbee_core.h": "c",
+    "esp_system.h": "c"
   }
 }

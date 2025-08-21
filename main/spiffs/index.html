@@ -50,15 +50,16 @@
             <label for="low_hyst">Hysteresis -:</label> <span id="low_hyst">N/A</span> °C
         </div>
         <div class="input-group">
-            <label for="relay">Position Relais:</label> 
+            <label>Commande Relais:</label> 
+            <span id="relay_commanded">N/A</span>
+            <span id="relay_mismatch" style="display:none;">(Mismatch)</span>
+            <p><label for="relay">Position Relais:</label> 
             <span id="relay_actual">N/A</span>
             <span id="relay_mismatch" style="display:none;">(Mismatch)</span>
+            </p>
             <p>État du chauffage :
                 <i id="relay_icon" class="fas fa-question-circle" style="color: orange; font-size: 2em; margin-left: 10px;"></i>
             </p>
-            <label>Relais Commande:</label> 
-            <span id="relay_commanded">N/A</span>
-            <span id="relay_mismatch" style="display:none;">(Mismatch)</span>
         </div>
         <div id="update_status" style="color: blue;"></div>
         <div class="input-group">
@@ -75,6 +76,9 @@
             <label for="new_low_hyst">Nouvel Hysteresis -:</label>
             <input type="number" id="new_low_hyst" step="0.1" value="0.1">
             <button onclick="startUpdateLowHysteresis()">Mise à jour Hysteresis -</button>
+        </div>
+        <div class="input-group">
+            <label for="operating_time">Temps de fonctionnement :</label> <span id="operating_time"> 0j 00h 00mn </span>
         </div>
 
 <script>
@@ -245,8 +249,22 @@
         startUpdate('low_hyst', low_hyst, 'low_hyst');
     }
 
+    function update_operating_time() {
+        fetch('/operating_time', { cache: 'no-store' })
+            .then(response => {
+                if (!response.ok) throw new Error('Network response was not ok ' + response.status);
+                return response.text();
+            })
+            .then(text => {
+                document.getElementById('operating_time').textContent = text || '0j 00h 00mn';
+            })
+            .catch(error => console.error('Error fetching function time:', error));
+    }
+
     fetchData();
+    update_operating_time();
     setInterval(fetchData, 5000);
+    setInterval(update_operating_time, 60000);
 </script>
     </div>
 <script>

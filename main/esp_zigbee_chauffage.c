@@ -1,5 +1,4 @@
-/*
- * SPDX-FileCopyrightText: 2021-2025 Espressif Systems (Shanghai) CO LTD
+/* SPDX-FileCopyrightText: 2021-2025 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: CC0-1.0
  */
@@ -11,6 +10,7 @@
 #include "freertos/task.h"
 #include "zcl/esp_zigbee_zcl_common.h"
 #include "zcl/esp_zigbee_zcl_basic.h"
+#include "zboss_api_core.h"
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "esp_event.h"
@@ -27,6 +27,12 @@
 #include <inttypes.h>
 #include <esp_timer.h>
 #include "cJSON.h"
+#include "zboss_api.h"
+#include "zboss_api_af.h"
+#include "zboss_api_zcl.h"
+#include "zboss_api_buf.h"
+#include "esp_mac.h"
+#include "esp_zigbee_core.h"
 
 static const char *TAG = "ESP_ZIGBEE_CHAUFFAGE";
 
@@ -40,19 +46,15 @@ uint16_t input_low_hyst = 10;  // 0.1°C par défaut
 static uint8_t relay_actual_state = 0xFF; // 0xFF = inconnu, 0 = OFF, 1 = ON
 static char *update_status = NULL;
 static char *status = NULL;
+static char *operating_time = NULL; // Format: "Xd Yh Zm"
 static uint8_t last_command_sent = 0xFF;
 
 static int s_retry_num = 0;
 static bool wifi_failed = false;
 static TaskHandle_t zb_task_handle = NULL;
 static bool first_request = true;
-
+static bool zigbee_network_initialized = false;
 static bool update_status_allocated = false;
-
-// Variables pour la gestion des écritures
-static int16_t target_setpoint = INT16_MIN;
-static uint16_t target_high_hyst = 0;
-static uint16_t target_low_hyst = 0;
 
 /* Compteur global pour les headers Lumi */
 static uint8_t lumi_counter = 0x10;
@@ -74,6 +76,9 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
 static esp_err_t post_handler(httpd_req_t *req);
 static esp_err_t data_handler(httpd_req_t *req);
 static uint8_t construct_lumi_header(uint8_t *buffer, uint8_t counter, uint8_t cmd_len, uint8_t cmd_id);
+static void update_server_attributes(void);
+void update_attributes_task(void *pvParameters);
+static void test_setpoint(void);
 
 static void save_settings_to_nvs(void) {
     nvs_handle_t nvs_handle;
@@ -164,13 +169,18 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         ESP_LOGI(TAG, "Signal: %s, Status: %s (0x%x)", esp_zb_zdo_signal_to_string(sig_type), esp_err_to_name(err_status), err_status);
         if (err_status == ESP_OK) {
             ESP_LOGI(TAG, "Joined Zigbee network successfully (PAN ID: 0x%04hx, Channel: %d, Short Address: 0x%04hx)",
-                     esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
+                    esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
             set_sensor_mode("external");  /* Activer le mode external au démarrage */
             read_thermostat_attributes();
             if (last_setpoint != INT16_MIN) {
                 ESP_LOGI(TAG, "Applying setpoint from NVS: %.1f °C", last_setpoint / 100.0);
                 set_external_temperature(last_setpoint);
             }
+            // Mettre le relais à OFF après l'initialisation Zigbee
+            send_on_off_command(ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID);
+            read_relay_state();
+            zigbee_network_initialized = true;
+            xTaskCreate(update_attributes_task, "Update_Attributes", 2048, NULL, 1, NULL);
         } else {
             ESP_LOGW(TAG, "Network %s failed with status: %s (0x%x)", esp_zb_zdo_signal_to_string(sig_type), esp_err_to_name(err_status), err_status);
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_wrapper, ESP_ZB_BDB_MODE_NETWORK_STEERING, 5000);
@@ -308,44 +318,106 @@ static void read_thermostat_attributes(void)
     ESP_LOGI(TAG, "Sent read requests for thermostat attributes");
 }
 
-static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_message_t *message)
-{
-    ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty message");
-    ESP_RETURN_ON_FALSE(message->status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG, 
-                        "Received message: error status(%d)", message->status);
-
+static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_message_t *message) 
+{ 
+    ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty message"); 
+    ESP_RETURN_ON_FALSE(message->status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG, "Received message: error status(%d)", message->status);
     ESP_LOGI(TAG, "Received report from address(0x%04x) src endpoint(%d) to dst endpoint(%d) cluster(0x%04x)", 
-             message->src_address.u.short_addr, message->src_endpoint, message->dst_endpoint, message->cluster);
+         message->src_address.u.short_addr, message->src_endpoint, message->dst_endpoint, message->cluster);
     ESP_LOGI(TAG, "Report information: attribute(0x%04x), type(0x%02x), value(%d)", 
-             message->attribute.id, message->attribute.data.type, 
-             message->attribute.data.value ? *(int16_t *)message->attribute.data.value : 0);
+            message->attribute.id, message->attribute.data.type, 
+            message->attribute.data.value ? *(int16_t *)message->attribute.data.value : 0);
 
     if (message->src_address.u.short_addr == THERMOSTAT) {
         if (message->cluster == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID) {
                 last_temperature = *(int16_t *)message->attribute.data.value;
                 ESP_LOGI(TAG, "Thermostat 0x%04x Température: %d.%d °C", 
-                         message->src_address.u.short_addr, 
-                         last_temperature / 100, abs(last_temperature % 100));
+                        message->src_address.u.short_addr, 
+                        last_temperature / 100, abs(last_temperature % 100));
             }
         } else if (message->cluster == ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID) {
                 last_humidity = *(uint16_t *)message->attribute.data.value;
                 ESP_LOGI(TAG, "Thermostat 0x%04x Humidité: %d.%d %%", 
-                         message->src_address.u.short_addr, 
-                         last_humidity / 100, abs(last_humidity % 100));
+                        message->src_address.u.short_addr, 
+                        last_humidity / 100, abs(last_humidity % 100));
             }
         } else if (message->cluster == 0xFCC0) {
             if (message->attribute.id == 0x0172) {
                 uint8_t sensor_mode = *(uint8_t *)message->attribute.data.value;
                 const char *mode_str = (sensor_mode == 2 || sensor_mode == 3) ? "external" : "internal";
                 ESP_LOGI(TAG, "Thermostat 0x%04x Sensor mode: %s (raw: %u)", 
-                         message->src_address.u.short_addr, mode_str, sensor_mode);
+                        message->src_address.u.short_addr, mode_str, sensor_mode);
+            }
+        } else if (message->cluster == ESP_ZB_ZCL_CLUSTER_ID_MULTI_INPUT) {
+            if (message->attribute.id == ESP_ZB_ZCL_ATTR_MULTI_VALUE_PRESENT_VALUE_ID) {
+                uint16_t button_value = *(uint16_t *)message->attribute.data.value;
+                if (button_value == 1) {
+                    if (message->src_endpoint == 1) {
+                        ESP_LOGI(TAG, "Button + pressed (single_plus, endpoint 1)");
+                        if (last_setpoint != INT16_MIN) {
+                            int16_t new_setpoint = last_setpoint + 10; // Augmenter de 0.1°C
+                            if (new_setpoint <= ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_MAX_VALUE) {
+                                set_external_temperature(new_setpoint);
+                                last_setpoint = new_setpoint;
+                                save_settings_to_nvs();
+                                ESP_LOGI(TAG, "Setpoint increased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
+                            } else {
+                                ESP_LOGW(TAG, "Setpoint not increased, max limit reached (%d)", new_setpoint);
+                            }
+                        }
+                    } else if (message->src_endpoint == 2) {
+                        ESP_LOGI(TAG, "Button center pressed (single_center, endpoint 2)");
+                        // Action pour le bouton central (par exemple, toggle relais ou mode)
+                        send_on_off_command(relay_actual_state == 1 ? ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID : ESP_ZB_ZCL_CMD_ON_OFF_ON_ID);
+                        read_relay_state();
+                    } else if (message->src_endpoint == 3) {
+                        ESP_LOGI(TAG, "Button - pressed (single_minus, endpoint 3)");
+                        if (last_setpoint != INT16_MIN) {
+                            int16_t new_setpoint = last_setpoint - 10; // Diminuer de 0.1°C
+                            if (new_setpoint >= ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_MIN_VALUE) {
+                                set_external_temperature(new_setpoint);
+                                last_setpoint = new_setpoint;
+                                save_settings_to_nvs();
+                                ESP_LOGI(TAG, "Setpoint decreased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
+                            } else {
+                                ESP_LOGW(TAG, "Setpoint not decreased, min limit reached (%d)", new_setpoint);
+                            }
+                        }
+                    }
+                }
             }
         }
 
+        test_setpoint(); // Appeler la fonction de test du setpoint
+
+        // Mettre à jour les attributs serveurs après réception des données
+        if (zigbee_network_initialized) {
+            update_server_attributes();
+        }
+    }
+
+    if (message->src_address.u.short_addr == RELAY_CHAUFF && message->cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
+        if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
+            relay_actual_state = (*(uint8_t *)message->attribute.data.value != 0) ? 1 : 0;
+            ESP_LOGI(TAG, "Relay 0x%04x On/Off state: %s", 
+                    message->src_address.u.short_addr, 
+                    (relay_actual_state == 1) ? "ON" : "OFF");
+            if (zigbee_network_initialized) {
+                update_server_attributes();
+            }
+        }
+    }
+
+    return ESP_OK;
+}
+
+static void test_setpoint(void)
+{
         // Logique du relais avec last_setpoint, input_high_hyst et input_low_hyst
-        if (last_temperature != INT16_MIN && last_setpoint != INT16_MIN) {
+        if (last_temperature != INT16_MIN && last_setpoint != INT16_MIN && 
+            input_high_hyst != 0 && input_low_hyst != 0) {
             if (last_temperature <= last_setpoint - (int16_t)input_low_hyst) {
                 send_on_off_command(ESP_ZB_ZCL_CMD_ON_OFF_ON_ID);
                 read_relay_state();
@@ -353,19 +425,11 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
                 send_on_off_command(ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID);
                 read_relay_state();
             }
+        } else {
+            ESP_LOGI(TAG, "Waiting for all data: temp=%d, setpoint=%d, high_hyst=%u, low_hyst=%u",
+                     last_temperature, last_setpoint, input_high_hyst, input_low_hyst);
         }
-    }
-    
-    if (message->src_address.u.short_addr == RELAY_CHAUFF && message->cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
-        if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
-            relay_actual_state = (*(uint8_t *)message->attribute.data.value != 0) ? 1 : 0;
-            ESP_LOGI(TAG, "Relay 0x%04x On/Off state: %s", 
-                     message->src_address.u.short_addr, 
-                     (relay_actual_state == 1) ? "ON" : "OFF");
-        }
-    }
 
-    return ESP_OK;
 }
 
 static void reset_update_status_task(void *pvParameters)
@@ -396,6 +460,7 @@ static void write_thermostat_attributes(int16_t new_setpoint, uint16_t new_high_
         set_external_temperature(new_setpoint);
         last_setpoint = new_setpoint; // Mettre à jour localement
         save_settings_to_nvs(); // Sauvegarder dans NVS
+        test_setpoint();
         asprintf(&update_status, "Setpoint modifié avec succès");
         update_status_allocated = true;
         ESP_LOGI(TAG, "Update status set to: %s", update_status);
@@ -936,6 +1001,18 @@ static esp_err_t status_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t operating_time_handler(httpd_req_t *req)
+{
+    char *res_car = operating_time ? operating_time : "0d 00h 00m";
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, res_car, strlen(res_car));
+    
+    // Do not free res_car, as it may point to a string literal or global buffer
+    return ESP_OK;
+}
+
+
 static httpd_handle_t start_webserver(void)
 {
     esp_vfs_spiffs_conf_t conf = {
@@ -989,12 +1066,19 @@ static httpd_handle_t start_webserver(void)
             .handler = status_handler,
             .user_ctx = NULL
         };
+        httpd_uri_t operating_time_uri = {
+            .uri = "/operating_time",
+            .method = HTTP_GET,
+            .handler = operating_time_handler,
+            .user_ctx = NULL            
+        };
 
         httpd_register_uri_handler(server, &get_uri);
         httpd_register_uri_handler(server, &favicon_uri);
         httpd_register_uri_handler(server, &post_uri);
         httpd_register_uri_handler(server, &data_uri);
         httpd_register_uri_handler(server, &status_uri);
+        httpd_register_uri_handler(server, &operating_time_uri);
         ESP_LOGI(TAG, "Web server started on port %d", config.server_port);
     } else {
         ESP_LOGE(TAG, "Failed to start web server");
@@ -1008,6 +1092,7 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZR_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
 
+    // Cluster Basic (serveur)
     uint8_t zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE;
     uint16_t app_version = 1;
     uint16_t stack_version = 0x0003;
@@ -1015,6 +1100,10 @@ static void esp_zb_task(void *pvParameters)
     char manu_name[] = ESP_MANUFACTURER_NAME;
     char model_id[] = ESP_MODEL_IDENTIFIER;
     esp_zb_attribute_list_t *esp_zb_basic_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_BASIC);
+    if (esp_zb_basic_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Basic cluster list");
+        return;
+    }
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_ZCL_VERSION_ID, &zcl_version);
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_APPLICATION_VERSION_ID, &app_version);
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_STACK_VERSION_ID, &stack_version);
@@ -1022,39 +1111,242 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, manu_name);
     esp_zb_basic_cluster_add_attr(esp_zb_basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, model_id);
 
-    // Ajout des clusters pour le binding avec le W100
-    esp_zb_attribute_list_t *esp_zb_identify_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY);
-    esp_zb_attribute_list_t *esp_zb_multi_state_input_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_MULTI_INPUT);
-    esp_zb_attribute_list_t *esp_zb_ota_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_OTA_UPGRADE);
-    esp_zb_attribute_list_t *esp_zb_power_cfg_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG);
-    esp_zb_attribute_list_t *esp_zb_manu_specific_lumi_cluster = esp_zb_zcl_attr_list_create(0xFCC0); // Cluster personnalisé
-    // Ajout des attributs pour manuSpecificLumi
-    uint8_t mode = 0; // Valeur par défaut (hypothétique, à confirmer)
-    esp_zb_custom_cluster_add_custom_attr(esp_zb_manu_specific_lumi_cluster, 0x0009, ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &mode);
-    uint32_t sampling_period = 30000; // Exemple : 30 secondes (en ms)
-    esp_zb_custom_cluster_add_custom_attr(esp_zb_manu_specific_lumi_cluster, 0x0162, ESP_ZB_ZCL_ATTR_TYPE_U32, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &sampling_period);
-    uint8_t sensor_type = 0; // 0: interne, 2: externe (à ajuster)
-    esp_zb_custom_cluster_add_custom_attr(esp_zb_manu_specific_lumi_cluster, 0x0172, ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &sensor_type);
-    uint8_t control_data = 0; // Données de contrôle pour 0xFFF2 (à définir)
-    esp_zb_custom_cluster_add_custom_attr(esp_zb_manu_specific_lumi_cluster, 0xFFF2, ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &control_data);
-    esp_zb_attribute_list_t *esp_zb_humidity_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT);
-    esp_zb_attribute_list_t *esp_zb_temperature_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT);
+    // Clusters pour le thermostat et le relais (clients)
+    esp_zb_attribute_list_t *esp_zb_thermostat_client_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT);
+    if (esp_zb_thermostat_client_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Thermostat client cluster list");
+        return;
+    }
+    esp_zb_attribute_list_t *esp_zb_on_off_client_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_ON_OFF);
+    if (esp_zb_on_off_client_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create On/Off client cluster list");
+        return;
+    }
 
+    // Clusters pour le binding avec le W100 (clients)
+    esp_zb_attribute_list_t *esp_zb_identify_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_IDENTIFY);
+    if (esp_zb_identify_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Identify cluster list");
+        return;
+    }
+    esp_zb_attribute_list_t *esp_zb_multi_state_input_client_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_MULTI_INPUT);
+    if (esp_zb_multi_state_input_client_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Multistate Input client cluster list");
+        return;
+    }
+    esp_zb_attribute_list_t *esp_zb_ota_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_OTA_UPGRADE);
+    if (esp_zb_ota_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create OTA cluster list");
+        return;
+    }
+    esp_zb_attribute_list_t *esp_zb_power_cfg_client_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG);
+    if (esp_zb_power_cfg_client_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Power Config client cluster list");
+        return;
+    }
+    esp_zb_attribute_list_t *esp_zb_manu_specific_lumi_cluster = esp_zb_zcl_attr_list_create(0xFCC0); // Cluster personnalisé
+    if (esp_zb_manu_specific_lumi_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Manufacturer Specific cluster list");
+        return;
+    }
+    uint8_t mode = 0; // Valeur par défaut
+    esp_zb_custom_cluster_add_custom_attr(esp_zb_manu_specific_lumi_cluster, 0x0009, ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &mode);
+    uint32_t sampling_period = 30000; // 30 secondes (en ms)
+    esp_zb_custom_cluster_add_custom_attr(esp_zb_manu_specific_lumi_cluster, 0x0162, ESP_ZB_ZCL_ATTR_TYPE_U32, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &sampling_period);
+    uint8_t sensor_type = 0; // 0: interne, 2: externe
+    esp_zb_custom_cluster_add_custom_attr(esp_zb_manu_specific_lumi_cluster, 0x0172, ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, &sensor_type);
+    uint8_t control_data = 0; // Données de contrôle pour 0xFFF2
+    esp_zb_custom_cluster_add_custom_attr(esp_zb_manu_specific_lumi_cluster, 0xFFF2, ESP_ZB_ZCL_ATTR_TYPE_U8, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE, &control_data);
+    esp_zb_attribute_list_t *esp_zb_humidity_client_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT);
+    if (esp_zb_humidity_client_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Humidity client cluster list");
+        return;
+    }
+    esp_zb_attribute_list_t *esp_zb_temperature_client_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT);
+    if (esp_zb_temperature_client_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Temperature client cluster list");
+        return;
+    }
+
+    ////////////////////// Clusters serveurs ////////////////////
+    // Initialisation explicite du cluster Basic
+    esp_zb_attribute_list_t *esp_zb_on_off_server_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_ON_OFF);
+    if (esp_zb_on_off_server_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create On/Off server cluster list");
+        return;
+    }
+    uint8_t on_off_value = 0; // Initialisé à OFF
+    esp_zb_zcl_status_t status = esp_zb_on_off_cluster_add_attr(esp_zb_on_off_server_cluster, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, &on_off_value);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add On/Off attribute: status 0x%02x", status);
+        return;
+    }
+
+    // Initialisation explicite du cluster Temperature Measurement
+    esp_zb_zcl_temp_measurement_init_server();
+    esp_zb_attribute_list_t *esp_zb_temperature_server_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT);
+    if (esp_zb_temperature_server_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Temperature server cluster list");
+        return;
+    }
+    int16_t temp_value = 0; // Valeur initiale
+    status = esp_zb_temperature_meas_cluster_add_attr(esp_zb_temperature_server_cluster, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, &temp_value);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Temperature MeasuredValue attribute: status 0x%02x", status);
+        return;
+    }
+    int16_t min_temp_value = ESP_ZB_ZCL_TEMP_MEASUREMENT_MIN_MEASURED_VALUE_MINIMUM; // -273.15°C
+    status = esp_zb_temperature_meas_cluster_add_attr(esp_zb_temperature_server_cluster, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_MIN_VALUE_ID, &min_temp_value);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Temperature MinMeasuredValue attribute: status 0x%02x", status);
+        return;
+    }
+    int16_t max_temp_value = ESP_ZB_ZCL_TEMP_MEASUREMENT_MAX_MEASURED_VALUE_MAXIMUM; // 327.67°C
+    status = esp_zb_temperature_meas_cluster_add_attr(esp_zb_temperature_server_cluster, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_MAX_VALUE_ID, &max_temp_value);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Temperature MaxMeasuredValue attribute: status 0x%02x", status);
+        return;
+    }
+
+    // Initialisation explicite du cluster Relative Humidity Measurement
+    esp_zb_zcl_rel_humidity_measurement_init_server();
+    esp_zb_attribute_list_t *esp_zb_humidity_server_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT);
+    if (esp_zb_humidity_server_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Humidity server cluster list");
+        return;
+    }
+    uint16_t humidity_value = 0; // Valeur initiale
+    status = esp_zb_humidity_meas_cluster_add_attr(esp_zb_humidity_server_cluster, ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID, &humidity_value);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Humidity MeasuredValue attribute: status 0x%02x", status);
+        return;
+    }
+    uint16_t min_humidity_value = ESP_ZB_ZCL_REL_HUMIDITY_MEASUREMENT_MIN_MEASURED_VALUE_MINIMUM; // 0%
+    status = esp_zb_humidity_meas_cluster_add_attr(esp_zb_humidity_server_cluster, ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_MIN_VALUE_ID, &min_humidity_value);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Humidity MinMeasuredValue attribute: status 0x%02x", status);
+        return;
+    }
+    uint16_t max_humidity_value = ESP_ZB_ZCL_REL_HUMIDITY_MEASUREMENT_MAX_MEASURED_VALUE_MAXIMUM; // 100%
+    status = esp_zb_humidity_meas_cluster_add_attr(esp_zb_humidity_server_cluster, ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_MAX_VALUE_ID, &max_humidity_value);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Humidity MaxMeasuredValue attribute: status 0x%02x", status);
+        return;
+    }
+
+    // Initialisation explicite du cluster Thermostat
+    zb_zcl_thermostat_init_server();
+    esp_zb_attribute_list_t *esp_zb_thermostat_server_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT);
+    if (esp_zb_thermostat_server_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Thermostat server cluster list");
+        return;
+    }
+    int16_t local_temp = 0; // Température locale initiale
+    status = esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_server_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID, &local_temp);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Thermostat LocalTemperature attribute: status 0x%02x", status);
+        return;
+    }
+    int16_t cool_setpoint = ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_DEFAULT_VALUE;
+    status = esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_server_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_ID, &cool_setpoint);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Thermostat OccupiedCoolingSetpoint attribute: status 0x%02x", status);
+        return;
+    }
+    int16_t heat_setpoint = ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_DEFAULT_VALUE;
+    status = esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_server_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID, &heat_setpoint);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Thermostat OccupiedHeatingSetpoint attribute: status 0x%02x", status);
+        return;
+    }
+    int8_t sequence_operation = ESP_ZB_ZCL_THERMOSTAT_CONTROL_SEQ_OF_OPERATION_HEATING_ONLY; // Séquence d'opération par défaut chauffage seulement
+    status = esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_server_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_CONTROL_SEQUENCE_OF_OPERATION_ID, &sequence_operation);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Thermostat ControlSequenceOfOperation attribute: status 0x%02x", status);
+        return;
+    }
+    int8_t sys_mode = ESP_ZB_ZCL_THERMOSTAT_SYSTEM_MODE_HEAT; // Mode système par défaut chauffage
+    status = esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_server_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID, &sys_mode);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Thermostat SystemMode attribute: status 0x%02x", status);
+        return;
+    }
+
+    // Ajout du cluster Multistate Input en mode serveur avec tous les attributs obligatoires
+    esp_zb_attribute_list_t *esp_zb_multistate_input_server_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_MULTI_INPUT);
+    if (esp_zb_multistate_input_server_cluster == NULL) {
+        ESP_LOGE(TAG, "Failed to create Multistate Input server cluster list");
+        return;
+    }
+    // Attributs obligatoires pour le cluster Multistate Input
+    bool out_of_service = ESP_ZB_ZCL_MULTI_INPUT_OUT_OF_SERVICE_DEFAULT_VALUE; // false
+    status = esp_zb_multistate_input_cluster_add_attr(esp_zb_multistate_input_server_cluster, 
+                                                                         ESP_ZB_ZCL_ATTR_MULTI_INPUT_OUT_OF_SERVICE_ID, 
+                                                                         &out_of_service);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Multistate Input OutOfService attribute: status 0x%02x", status);
+        return;
+    }
+    uint16_t present_value = ESP_ZB_ZCL_MULTI_INPUT_PRESENT_VALUE_DEFAULT_VALUE; // 0
+    status = esp_zb_multistate_input_cluster_add_attr(esp_zb_multistate_input_server_cluster, 
+                                                     ESP_ZB_ZCL_ATTR_MULTI_INPUT_PRESENT_VALUE_ID, 
+                                                     &present_value);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Multistate Input PresentValue attribute: status 0x%02x", status);
+        return;
+    }
+    uint8_t status_flags = ESP_ZB_ZCL_MULTI_INPUT_STATUS_FLAGS_DEFAULT_VALUE; // 0
+    status = esp_zb_multistate_input_cluster_add_attr(esp_zb_multistate_input_server_cluster, 
+                                                     ESP_ZB_ZCL_ATTR_MULTI_INPUT_STATUS_FLAGS_ID, 
+                                                     &status_flags);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Multistate Input StatusFlags attribute: status 0x%02x", status);
+        return;
+    }
+    uint16_t number_of_states = 3; // 3 états pour correspondre aux boutons (peut être ajusté selon besoin)
+    status = esp_zb_multistate_input_cluster_add_attr(esp_zb_multistate_input_server_cluster, 
+                                                     ESP_ZB_ZCL_ATTR_MULTI_INPUT_NUMBER_OF_STATES_ID, 
+                                                     &number_of_states);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Multistate Input NumberOfStates attribute: status 0x%02x", status);
+        return;
+    }    
+
+    ////////////////////// Liste des clusters ////////////////////
     esp_zb_cluster_list_t *esp_zb_cluster_list = esp_zb_zcl_cluster_list_create();
+    if (esp_zb_cluster_list == NULL) {
+        ESP_LOGE(TAG, "Failed to create cluster list");
+        return;
+    }
     esp_zb_cluster_list_add_basic_cluster(esp_zb_cluster_list, esp_zb_basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     esp_zb_cluster_list_add_identify_cluster(esp_zb_cluster_list, esp_zb_identify_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
-    esp_zb_cluster_list_add_multistate_value_cluster(esp_zb_cluster_list, esp_zb_multi_state_input_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+    esp_zb_cluster_list_add_multistate_value_cluster(esp_zb_cluster_list, esp_zb_multi_state_input_client_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
     esp_zb_cluster_list_add_ota_cluster(esp_zb_cluster_list, esp_zb_ota_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
-    esp_zb_cluster_list_add_power_config_cluster(esp_zb_cluster_list, esp_zb_power_cfg_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
-    esp_zb_cluster_list_add_custom_cluster(esp_zb_cluster_list, esp_zb_manu_specific_lumi_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE); // Ajout du cluster personnalisé
-    esp_zb_cluster_list_add_humidity_meas_cluster(esp_zb_cluster_list, esp_zb_humidity_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
-    esp_zb_cluster_list_add_temperature_meas_cluster(esp_zb_cluster_list, esp_zb_temperature_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+    esp_zb_cluster_list_add_power_config_cluster(esp_zb_cluster_list, esp_zb_power_cfg_client_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+    esp_zb_cluster_list_add_custom_cluster(esp_zb_cluster_list, esp_zb_manu_specific_lumi_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+    esp_zb_cluster_list_add_humidity_meas_cluster(esp_zb_cluster_list, esp_zb_humidity_client_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+    esp_zb_cluster_list_add_temperature_meas_cluster(esp_zb_cluster_list, esp_zb_temperature_client_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+    esp_zb_cluster_list_add_thermostat_cluster(esp_zb_cluster_list, esp_zb_thermostat_client_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+    esp_zb_cluster_list_add_on_off_cluster(esp_zb_cluster_list, esp_zb_on_off_client_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
 
+    // Ajout des clusters serveurs
+    esp_zb_cluster_list_add_on_off_cluster(esp_zb_cluster_list, esp_zb_on_off_server_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_cluster_list_add_temperature_meas_cluster(esp_zb_cluster_list, esp_zb_temperature_server_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_cluster_list_add_humidity_meas_cluster(esp_zb_cluster_list, esp_zb_humidity_server_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_cluster_list_add_thermostat_cluster(esp_zb_cluster_list, esp_zb_thermostat_server_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_cluster_list_add_multistate_value_cluster(esp_zb_cluster_list, esp_zb_multistate_input_server_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);    
+
+
+    // Création de la liste des endpoints
     esp_zb_ep_list_t *esp_zb_ep_list = esp_zb_ep_list_create();
+    if (esp_zb_ep_list == NULL) {
+        ESP_LOGE(TAG, "Failed to create endpoint list");
+        return;
+    }
     esp_zb_endpoint_config_t endpoint_config = {
         .endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id = ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID,
+        .app_device_id = ESP_ZB_HA_THERMOSTAT_DEVICE_ID,
         .app_device_version = 0
     };
     esp_zb_ep_list_add_ep(esp_zb_ep_list, esp_zb_cluster_list, endpoint_config);
@@ -1065,11 +1357,84 @@ static void esp_zb_task(void *pvParameters)
 
     ESP_ERROR_CHECK(esp_zb_start(true));
     ESP_LOGI(TAG, "Free heap size after Zigbee start: %lu bytes", esp_get_free_heap_size());
-    
+
+    // Mettre à jour les attributs serveurs initialement
+    update_server_attributes();
+
     while (1) {
         esp_zb_stack_main_loop();
         vTaskDelay(50 / portTICK_PERIOD_MS);
     }
+}
+
+// Fonction update_attributes_task
+void update_attributes_task(void *pvParameters)
+{
+    while (1) {
+        update_server_attributes();
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+
+// Fonction update_server_attributes
+static void update_server_attributes(void)
+{
+    if (!zigbee_network_initialized) {
+        ESP_LOGW(TAG, "Zigbee network not initialized, skipping attribute update");
+        return;
+    }
+    esp_zb_zcl_status_t status;
+
+    // Mettre à jour l'attribut OnOff du cluster On/Off serveur
+    uint8_t on_off_value = (relay_actual_state != 0xFF) ? relay_actual_state : 0;
+    status = esp_zb_zcl_set_attribute_val(
+        HA_ONOFF_SWITCH_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
+        &on_off_value,
+        false
+    );
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "Failed to update On/Off attribute: status 0x%02x", status);
+    }
+
+    // Mettre à jour l'attribut MeasuredValue du cluster Relative Humidity Measurement serveur
+    ESP_LOGI(TAG, "last_humidity = %d", last_humidity); // Log pour débogage
+    uint16_t humidity_value = (last_humidity != INT16_MIN && last_humidity >= 0) ? last_humidity : 0;
+    if (humidity_value > ESP_ZB_ZCL_REL_HUMIDITY_MEASUREMENT_MAX_MEASURED_VALUE_MAXIMUM) { // Plage : 0 à 10000
+        ESP_LOGW(TAG, "Humidity value out of range: %u, setting to 0", humidity_value);
+        humidity_value = 0;
+    }
+    status = esp_zb_zcl_set_attribute_val(
+        HA_ONOFF_SWITCH_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID,
+        &humidity_value,
+        false
+    );
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "Failed to update Humidity MeasuredValue attribute: status 0x%02x", status);
+    }
+
+    // Mettre à jour l'attribut MeasuredValue du cluster Temperature Measurement serveur
+    ESP_LOGI(TAG, "last_temperature = %d", last_temperature); // Log pour débogage
+    int16_t temp_value = (last_temperature != INT16_MIN && last_temperature >= ESP_ZB_ZCL_TEMP_MEASUREMENT_MIN_MEASURED_VALUE_MINIMUM) ? last_temperature : 0;
+    status = esp_zb_zcl_set_attribute_val(
+        HA_ONOFF_SWITCH_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+        &temp_value,
+        false
+    );
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "Failed to update Temperature MeasuredValue attribute: status 0x%02x", status);
+    }
+
+    ESP_LOGI(TAG, "Updated server attributes: OnOff=%u, Temp=%d, Humidity=%u",
+             on_off_value, temp_value, humidity_value);
 }
 
 /* Fonction pour construire le header Lumi */
@@ -1374,11 +1739,16 @@ void watchdog_task(void *pvParameters)
     while (1) {
         watchdog_counter++;
         total_seconds++;
-        if (watchdog_counter >= 120) {
+        if (watchdog_counter >= 60) {
             int jours = total_seconds / 86400;
             int heures = (total_seconds % 86400) / 3600;
             int minutes = (total_seconds % 3600) / 60;
             watchdog_counter = 0;
+            //if (operating_time) free(operating_time);
+            operating_time = malloc(32);
+            if (operating_time) {
+                snprintf(operating_time, 32, "%dd %02dh %02dm", jours, heures, minutes);
+            }
             ESP_LOGW("WATCHDOG", "Je nourris le chien depuis %dj %02dh %02dm", jours, heures, minutes);
         }
         esp_task_wdt_reset();
