@@ -29,10 +29,11 @@
 #define DEFAULT_OCCUPIED_HEATING_SETPOINT 2100      /* en centièmes de degré */
 #define THERMOSTAT                      0xDAEF      /* Thermostat device ID SMABIT = 0xD5AA Aqara W100 = 0xDAEF */
 #define THERMOSTAT_IEEE                 {0x54, 0xEF, 0x44, 0x10, 0x01, 0x26, 0x3E, 0xF3} /* IEEE address of the thermostat */
+#define HUB_IEEE                        {0x54, 0xEF, 0x44, 0x80, 0x71, 0x1A} // Adresse MAC d'un hub M3 aqara
 #define HYSTERESIS_MOINS                10          /* Hysteresis inférieur en centièmes de degré */
 #define HYSTERESIS_PLUS                 10          /* Hysteresis supérieur en centièmes de degré */
 #define MANUFACTURER_CODE               0x115F      // Code Bitron (SMABIT) = 0x1071 Aqara = 0x115F
-// #define W100_DEVICE                     0xDAEF      // Nouvelle adresse pour le W100
+#define MAX_RETRIES                     3           // Nombre maximum de tentatives
 
 // Attributs personnalisés dans le cluster Basic
 #define ZCL_THERMOSTAT_ATTR_RELAY_STATE          0xF000

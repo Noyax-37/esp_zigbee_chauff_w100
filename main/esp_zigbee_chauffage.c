@@ -55,6 +55,8 @@ static TaskHandle_t zb_task_handle = NULL;
 static bool first_request = true;
 static bool zigbee_network_initialized = false;
 static bool update_status_allocated = false;
+static bool response_received = false;
+static uint8_t last_tsn = 0;
 
 /* Compteur global pour les headers Lumi */
 static uint8_t lumi_counter = 0x10;
@@ -63,6 +65,7 @@ static uint8_t lumi_counter = 0x10;
 static void esp_zb_task(void *pvParameters);
 static httpd_handle_t start_webserver(void);
 static void read_thermostat_attributes(void);
+static void read_thermostat_attributes_pmtsd(void);
 static void read_relay_state(void);
 static void write_thermostat_attributes(int16_t new_setpoint, uint16_t new_high_hyst, uint16_t new_low_hyst,
                                        bool setpoint_updated, bool hysteresis_high_updated, bool hysteresis_low_updated);
@@ -79,6 +82,9 @@ static uint8_t construct_lumi_header(uint8_t *buffer, uint8_t counter, uint8_t c
 static void update_server_attributes(void);
 void update_attributes_task(void *pvParameters);
 static void test_setpoint(void);
+static void send_hvac_on_command(void);
+static void send_hvac_off_command(void);
+static void send_pmtsd_command(void);
 
 static void save_settings_to_nvs(void) {
     nvs_handle_t nvs_handle;
@@ -162,6 +168,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     esp_err_t err_status = signal_struct->esp_err_status;
     esp_zb_app_signal_type_t sig_type = *p_sg_p;
 
+    /* Gestion des signaux BDB */
     switch (sig_type) {
     case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
@@ -179,6 +186,13 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             // Mettre le relais à OFF après l'initialisation Zigbee
             send_on_off_command(ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID);
             read_relay_state();
+            // Activer le mode HVAC ON sur l'Aqara W100
+            send_hvac_on_command();
+            // Activer la rangée centrale avec PMTSD
+            send_pmtsd_command();
+            // Mettre l'humidité ext à 0 (provisoire)
+            set_external_humidity(0);
+
             zigbee_network_initialized = true;
             xTaskCreate(update_attributes_task, "Update_Attributes", 2048, NULL, 1, NULL);
         } else {
@@ -206,15 +220,47 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             .clusterID = 0xFCC0,
             .manuf_specific = 1,
             .manuf_code = MANUFACTURER_CODE,
-            .attr_number = 1,
-            .attr_field = (uint16_t[]){0x0172},
+            .attr_number = 2,
+            .attr_field = (uint16_t[]){0x0172, 0xFFF2},
         };
         esp_zb_zcl_read_attr_cmd_req(&read_cmd);
         ESP_LOGI(TAG, "Sent read request for mode attribute (0x0172)");
         break;
     default:
-        ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s (0x%x)", 
-                 esp_zb_zdo_signal_to_string(sig_type), sig_type, esp_err_to_name(err_status), err_status);
+        /* Gestion des commandes ZCL */
+        if (sig_type == ZB_ZCL_CMD_READ_ATTRIB_RESP) {
+            esp_zb_zcl_command_send_status_message_t *resp = (esp_zb_zcl_command_send_status_message_t *)signal_struct->p_app_signal;
+            if (resp->status == ESP_OK) {
+                ESP_LOGI(TAG, "Read attribute response received, TSN: %d, Endpoint: %d", resp->tsn, resp->dst_endpoint);
+                /* Pour parser les valeurs des attributs, vous devrez peut-être utiliser ZB_ZCL_GENERAL_GET_READ_ATTRIB_RESP */
+                /* Exemple : zb_zcl_read_attr_res_t *attr_resp = ZB_ZCL_GENERAL_GET_READ_ATTRIB_RESP(...); */
+            } else {
+                ESP_LOGW(TAG, "Read attribute failed, status: %s (0x%x)", esp_err_to_name(resp->status), resp->status);
+            }
+        } else if (sig_type == ZB_ZCL_CMD_WRITE_ATTRIB_RESP) {
+            esp_zb_zcl_command_send_status_message_t *resp = (esp_zb_zcl_command_send_status_message_t *)signal_struct->p_app_signal;
+            if (resp->status == ESP_OK) {
+                ESP_LOGI(TAG, "Write attribute response received, TSN: %d, Endpoint: %d", resp->tsn, resp->dst_endpoint);
+            } else {
+                ESP_LOGW(TAG, "Write attribute failed, status: %s (0x%x)", esp_err_to_name(resp->status), resp->status);
+            }
+        } else if (sig_type == ZB_ZCL_CMD_CONFIG_REPORT_RESP) { /* Utiliser ZB_ZCL_CMD_CONFIG_REPORT_RESP au lieu de ZB_ZCL_CMD_CONFIG_REPORT */
+            esp_zb_zcl_command_send_status_message_t *resp = (esp_zb_zcl_command_send_status_message_t *)signal_struct->p_app_signal;
+            if (resp->status == ESP_OK) {
+                ESP_LOGI(TAG, "Configure report response received, TSN: %d, Endpoint: %d", resp->tsn, resp->dst_endpoint);
+            } else {
+                ESP_LOGW(TAG, "Configure report failed, status: %s (0x%x)", esp_err_to_name(resp->status), resp->status);
+            }
+        } else if (sig_type == ZB_ZCL_CMD_REPORT_ATTRIB) {
+            esp_zb_zcl_report_attr_cmd_t *report = (esp_zb_zcl_report_attr_cmd_t *)signal_struct->p_app_signal;
+            ESP_LOGI(TAG, "Attribute report received, ClusterID: 0x%04x, AttributeID: 0x%04x", 
+                     report->clusterID, report->attributeID);
+            /* Les valeurs d'attributs doivent être parsées séparément via esp_zb_zcl_attribute_t */
+            /* Exemple : utiliser ZB_ZCL_GET_ATTRIBUTE_VALUE si disponible */
+        } else {
+            ESP_LOGI(TAG, "Unknown signal: %s (0x%x), status: %s (0x%x)", 
+                     esp_zb_zdo_signal_to_string(sig_type), sig_type, esp_err_to_name(err_status), err_status);
+        }
         break;
     }
 }
@@ -265,6 +311,27 @@ static void read_relay_state(void)
     ESP_LOGI(TAG, "Sent read request for relay state (0x0000)");
 }
 
+static void read_thermostat_attributes_pmtsd(void)
+{
+    // Lecture du pmtsd
+    esp_zb_zcl_read_attr_cmd_t cmd_pmtsd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_endpoint = 1,
+            .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = 0xFCC0,
+        .manuf_specific = 1,
+        .manuf_code = MANUFACTURER_CODE,
+        .attr_number = 1,
+        .attr_field = (uint16_t[]){0xFFF2},
+    };
+    esp_zb_zcl_read_attr_cmd_req(&cmd_pmtsd);
+
+    ESP_LOGI(TAG, "Sent read requests for thermostat attributes");
+}
+
 static void read_thermostat_attributes(void)
 {
     // Lecture de la température locale
@@ -310,8 +377,8 @@ static void read_thermostat_attributes(void)
         .clusterID = 0xFCC0,
         .manuf_specific = 1,
         .manuf_code = MANUFACTURER_CODE,
-        .attr_number = 1,
-        .attr_field = (uint16_t[]){0x0172}, // sensor
+        .attr_number = 2,
+        .attr_field = (uint16_t[]){0x0172, 0xFFF2},
     };
     esp_zb_zcl_read_attr_cmd_req(&cmd_specific);
 
@@ -349,6 +416,25 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
                 const char *mode_str = (sensor_mode == 2 || sensor_mode == 3) ? "external" : "internal";
                 ESP_LOGI(TAG, "Thermostat 0x%04x Sensor mode: %s (raw: %u)", 
                         message->src_address.u.short_addr, mode_str, sensor_mode);
+            } else if (message->attribute.id == 0xFFF2) {
+                // Rapport PMTSD reçu de l'Aqara W100
+                ESP_LOGI(TAG, "Received PMTSD report from Aqara W100 (0x%04x, endpoint %d)", 
+                        message->src_address.u.short_addr, message->src_endpoint);
+                ESP_LOG_BUFFER_HEX(TAG, message->attribute.data.value, message->attribute.data.size);
+
+                // Vérifier si c'est une demande PMTSD (contient "08:00:08:44" à la fin)
+                uint8_t *data = (uint8_t *)message->attribute.data.value;
+                int data_len = message->attribute.data.size;
+                if (data_len >= 4 && data[data_len - 4] == 0x08 && data[data_len - 3] == 0x00 && 
+                    data[data_len - 2] == 0x08 && data[data_len - 1] == 0x44) {
+                    ESP_LOGI(TAG, "Detected PMTSD request from Aqara W100, responding with PMTSD command");
+                    // TODO: Implémenter send_pmtsd_command() pour répondre avec l'état PMTSD actuel
+                    // Pour l'instant, envoyez une commande HVAC ON pour maintenir l'état
+                    send_hvac_on_command();
+                } else {
+                    // Décoder les données PMTSD si nécessaire (voir DecodePMTSD_FD.py pour la logique)
+                    ESP_LOGI(TAG, "Received PMTSD data update, decoding not implemented yet");
+                }
             }
         } else if (message->cluster == ESP_ZB_ZCL_CLUSTER_ID_MULTI_INPUT) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_MULTI_VALUE_PRESENT_VALUE_ID) {
@@ -358,14 +444,10 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
                         ESP_LOGI(TAG, "Button + pressed (single_plus, endpoint 1)");
                         if (last_setpoint != INT16_MIN) {
                             int16_t new_setpoint = last_setpoint + 10; // Augmenter de 0.1°C
-                            if (new_setpoint <= ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_MAX_VALUE) {
-                                set_external_temperature(new_setpoint);
-                                last_setpoint = new_setpoint;
-                                save_settings_to_nvs();
-                                ESP_LOGI(TAG, "Setpoint increased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
-                            } else {
-                                ESP_LOGW(TAG, "Setpoint not increased, max limit reached (%d)", new_setpoint);
-                            }
+                            set_external_temperature(new_setpoint);
+                            last_setpoint = new_setpoint;
+                            save_settings_to_nvs();
+                            ESP_LOGI(TAG, "Setpoint increased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
                         }
                     } else if (message->src_endpoint == 2) {
                         ESP_LOGI(TAG, "Button center pressed (single_center, endpoint 2)");
@@ -376,14 +458,10 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
                         ESP_LOGI(TAG, "Button - pressed (single_minus, endpoint 3)");
                         if (last_setpoint != INT16_MIN) {
                             int16_t new_setpoint = last_setpoint - 10; // Diminuer de 0.1°C
-                            if (new_setpoint >= ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_MIN_VALUE) {
-                                set_external_temperature(new_setpoint);
-                                last_setpoint = new_setpoint;
-                                save_settings_to_nvs();
-                                ESP_LOGI(TAG, "Setpoint decreased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
-                            } else {
-                                ESP_LOGW(TAG, "Setpoint not decreased, min limit reached (%d)", new_setpoint);
-                            }
+                            set_external_temperature(new_setpoint);
+                            last_setpoint = new_setpoint;
+                            save_settings_to_nvs();
+                            ESP_LOGI(TAG, "Setpoint decreased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
                         }
                     }
                 }
@@ -545,11 +623,48 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
             if (variable->status == ESP_ZB_ZCL_STATUS_SUCCESS) {
                 if (resp->info.cluster == 0xFCC0 && variable->attribute.id == 0x0172) {
                     uint8_t mode = *(uint8_t *)variable->attribute.data.value;
-                    ESP_LOGI(TAG, "Read mode attribute (0x0172, cluster 0xFCC0): %d", mode);
-                    if (mode == 0x02 || mode == 0x03) {
-                        ESP_LOGI(TAG, "Thermostat in external sensor mode");
+                    const char *mode_str = (mode == 0x02 || mode == 0x03) ? "external" : "internal";
+                    ESP_LOGI(TAG, "Sensor mode: %s (raw: %u)", mode_str, mode);
+                    if (mode != 0x02 && mode != 0x03) {
+                        ESP_LOGW(TAG, "Thermostat not in external sensor mode, setting to external");
+                        set_sensor_mode("external");
+                    }
+                }
+                if (resp->info.cluster == 0xFCC0 && variable->attribute.id == 0xFFF2) {
+                    uint8_t *data = (uint8_t *)variable->attribute.data.value;
+                    uint16_t data_len = variable->attribute.data.size;
+                    ESP_LOGI(TAG, "Reception sur attribut 0xFFF2, length: %d", data_len);
+                    ESP_LOG_BUFFER_HEX(TAG, data, data_len);
+                    // Vérifier si c'est une requête PMTSD
+                    if (data_len >= 4 && data[data_len - 4] == 0x08 && data[data_len - 3] == 0x00 &&
+                        data[data_len - 2] == 0x08 && data[data_len - 1] == 0x44) {
+                        ESP_LOGI(TAG, "Detected PMTSD request, sending response");
+                        send_pmtsd_command();
                     } else {
-                        ESP_LOGW(TAG, "Thermostat not in external sensor mode (mode=%d)", mode);
+                        // Tenter de décoder comme ASCII (PMTSD)
+                        char pmtsd_str[32] = {0};
+                        if (data_len < sizeof(pmtsd_str) && data[0] >= 'P' && data[0] <= 'Z') {
+                            memcpy(pmtsd_str, data, data_len);
+                            ESP_LOGI(TAG, "PMTSD data: %s", pmtsd_str);
+                            char *token = strtok(pmtsd_str, "_");
+                            while (token != NULL) {
+                                if (token[0] == 'P') ESP_LOGI(TAG, "Power: %s", token + 1);
+                                else if (token[0] == 'M') ESP_LOGI(TAG, "Mode: %s", token + 1);
+                                else if (token[0] == 'T') ESP_LOGI(TAG, "Temperature: %s", token + 1);
+                                else if (token[0] == 'S') ESP_LOGI(TAG, "Speed: %s", token + 1);
+                                else if (token[0] == 'D') ESP_LOGI(TAG, "D: %s", token + 1);
+                                token = strtok(NULL, "_");
+                            }
+                        } else {
+                            // Rapport non-ASCII (par exemple, état HVAC)
+                            ESP_LOGI(TAG, "Non-ASCII PMTSD report, length: %d", data_len);
+                            // Logique inspirée de DecodePMTSD_FD (à implémenter selon le convertisseur)
+                            if (data_len == 9 && data[0] == 0x02 && data[1] == 0x41 && data[2] == 0x2f) {
+                                // Exemple hypothétique basé sur la structure du rapport
+                                ESP_LOGI(TAG, "Possible HVAC state report");
+                                // Ajouter une logique pour extraire des informations spécifiques
+                            }
+                        }
                     }
                 }
             } else {
@@ -1012,6 +1127,35 @@ static esp_err_t operating_time_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t hvac_on_handler(httpd_req_t *req)
+{
+    char response[100];
+    send_hvac_on_command();
+    snprintf(response, sizeof(response), "{\"status\":\"HVAC ON command sent\"}");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response, strlen(response));
+    return ESP_OK;
+}
+
+static esp_err_t hvac_off_handler(httpd_req_t *req)
+{
+    char response[100];
+    send_hvac_off_command();
+    snprintf(response, sizeof(response), "{\"status\":\"HVAC OFF command sent\"}");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response, strlen(response));
+    return ESP_OK;
+}
+
+static esp_err_t pmtsd_handler(httpd_req_t *req)
+{
+    char response[100];
+    send_pmtsd_command();
+    snprintf(response, sizeof(response), "{\"status\":\"PMTSD command sent\"}");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, response, strlen(response));
+    return ESP_OK;
+}
 
 static httpd_handle_t start_webserver(void)
 {
@@ -1033,6 +1177,7 @@ static httpd_handle_t start_webserver(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 114688;
+    config.max_uri_handlers = 12;
     httpd_handle_t server = NULL;
 
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -1072,13 +1217,33 @@ static httpd_handle_t start_webserver(void)
             .handler = operating_time_handler,
             .user_ctx = NULL            
         };
-
+        httpd_uri_t hvac_on = {
+            .uri       = "/hvac_on",
+            .method    = HTTP_POST,
+            .handler   = hvac_on_handler,
+            .user_ctx  = NULL
+        };
+        httpd_uri_t hvac_off = {
+            .uri       = "/hvac_off",
+            .method    = HTTP_POST,
+            .handler   = hvac_off_handler,
+            .user_ctx  = NULL
+        };
+        httpd_uri_t pmtsd = {
+            .uri       = "/pmtsd",
+            .method    = HTTP_POST,
+            .handler   = pmtsd_handler,
+            .user_ctx  = NULL
+        };
         httpd_register_uri_handler(server, &get_uri);
         httpd_register_uri_handler(server, &favicon_uri);
         httpd_register_uri_handler(server, &post_uri);
         httpd_register_uri_handler(server, &data_uri);
         httpd_register_uri_handler(server, &status_uri);
         httpd_register_uri_handler(server, &operating_time_uri);
+        httpd_register_uri_handler(server, &hvac_on);
+        httpd_register_uri_handler(server, &hvac_off);
+        httpd_register_uri_handler(server, &pmtsd);
         ESP_LOGI(TAG, "Web server started on port %d", config.server_port);
     } else {
         ESP_LOGE(TAG, "Failed to start web server");
@@ -1437,6 +1602,290 @@ static void update_server_attributes(void)
              on_off_value, temp_value, humidity_value);
 }
 
+static void send_hvac_on_command(void) {
+    // Adresses MAC
+    uint8_t device_mac[] = THERMOSTAT_IEEE;
+    uint8_t hub_mac[] = HUB_IEEE;
+
+    // Préfixe Zigbee
+    uint8_t prefix[] = {0xAA, 0x71, 0x32, 0x44};
+    uint8_t random_bytes[2];
+    random_bytes[0] = (uint8_t)(esp_random() & 0xFF);
+    random_bytes[1] = (uint8_t)(esp_random() & 0xFF);
+
+    // En-tête Zigbee
+    uint8_t zigbee_header[] = {0x02, 0x41, 0x2F, 0x68, 0x91};
+
+    // ID de message (2 octets aléatoires) + contrôle (0x18)
+    uint8_t message_id[2];
+    message_id[0] = (uint8_t)(esp_random() & 0xFF);
+    message_id[1] = (uint8_t)(esp_random() & 0xFF);
+    uint8_t message_control = 0x18;
+
+    // Adresses MAC (device + 00:00 + hub)
+    uint8_t payload_macs[16];
+    memcpy(payload_macs, device_mac, 8);
+    payload_macs[8] = 0x00;
+    payload_macs[9] = 0x00;
+    memcpy(payload_macs + 10, hub_mac, 6);
+
+    // Charge utile (power=0 pour ON)
+    uint8_t payload_tail[] = {0x08, 0x00, 0x08, 0x44, 0x15, 0x0a, 0x01, 0x09, 0xe7, 0xa9, 0xba, 0xe8, 0xb0, 0x83, 0xe5, 0x8a, 0x9f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x2a, 0x40};
+
+    // Construire la trame
+    uint8_t frame[64];
+    int idx = 0;
+    for (int i = 0; i < sizeof(prefix); i++) {
+        frame[idx++] = prefix[i];
+    }
+    for (int i = 0; i < sizeof(random_bytes); i++) {
+        frame[idx++] = random_bytes[i];
+    }
+    for (int i = 0; i < sizeof(zigbee_header); i++) {
+        frame[idx++] = zigbee_header[i];
+    }
+    for (int i = 0; i < sizeof(message_id); i++) {
+        frame[idx++] = message_id[i];
+    }
+    frame[idx++] = message_control;
+    for (int i = 0; i < sizeof(payload_macs); i++) {
+        frame[idx++] = payload_macs[i];
+    }
+    for (int i = 0; i < sizeof(payload_tail); i++) {
+        frame[idx++] = payload_tail[i];
+    }
+
+    // Log de la trame pour débogage
+    ESP_LOGI(TAG, "HVAC ON trame envoyée au w100:");
+    ESP_LOG_BUFFER_HEX(TAG, frame, idx);
+
+    // Préparer l'attribut OCTET_STRING
+    uint8_t attr_buf[1 + idx];
+    attr_buf[0] = idx; // Longueur de la trame
+    memcpy(attr_buf + 1, frame, idx);
+
+    esp_zb_zcl_attribute_t attr = {
+        .id = 0xFFF2, // Attribut 65522
+        .data.type = ESP_ZB_ZCL_ATTR_TYPE_OCTET_STRING,
+        .data.value = attr_buf
+    };
+
+    esp_zb_zcl_write_attr_cmd_t cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = THERMOSTAT, // 0xDAEF
+            .dst_endpoint = 1, // Endpoint 1 du thermostat
+            .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT, // Endpoint local
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = 0xFCC0, // Cluster manuSpecificLumi
+        .manuf_specific = 1,
+        .manuf_code = MANUFACTURER_CODE,
+        .attr_number = 1,
+        .attr_field = &attr,
+    };
+
+    esp_zb_zcl_status_t tsn;
+    response_received = false;
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    tsn = esp_zb_zcl_write_attr_cmd_req(&cmd);
+    esp_zb_lock_release();
+
+    last_tsn = tsn;
+    ESP_LOGI(TAG, "HVAC ON command sent to Aqara W100 (0x%04x, endpoint 1, cluster 0xFCC0), TSN: 0x%02x", THERMOSTAT, tsn);
+
+    // Attendre une réponse ZCL
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    read_thermostat_attributes_pmtsd();
+
+
+}
+
+static void send_hvac_off_command(void)
+{
+    // Adresse MAC du thermostat
+    uint8_t device_mac[] = THERMOSTAT_IEEE;
+
+    // Préfixe Zigbee pour la commande OFF
+    uint8_t prefix[] = {0xAA, 0x71, 0x1C, 0x44, 0x69, 0x1C};
+
+    // En-tête Zigbee
+    uint8_t zigbee_header[] = {0x04, 0x41, 0x19, 0x68, 0x91};
+
+    // ID de message (2 octets aléatoires) + contrôle (0x18)
+    uint8_t message_id[2];
+    message_id[0] = (uint8_t)(esp_random() & 0xFF); // Frame ID
+    message_id[1] = (uint8_t)(esp_random() & 0xFF); // Sequence
+    uint8_t message_control = 0x18;
+
+    // Construire la trame
+    uint8_t frame[34]; // Longueur fixe de 34 octets
+    int idx = 0;
+
+    // Ajouter le préfixe
+    for (int i = 0; i < sizeof(prefix); i++) {
+        frame[idx++] = prefix[i];
+    }
+
+    // Ajouter l'en-tête Zigbee
+    for (int i = 0; i < sizeof(zigbee_header); i++) {
+        frame[idx++] = zigbee_header[i];
+    }
+
+    // Ajouter l'ID de message et le contrôle
+    for (int i = 0; i < sizeof(message_id); i++) {
+        frame[idx++] = message_id[i];
+    }
+    frame[idx++] = message_control;
+
+    // Ajouter l'adresse MAC du thermostat
+    for (int i = 0; i < 8; i++) {
+        frame[idx++] = device_mac[i];
+    }
+
+    // Remplir avec des zéros jusqu'à 34 octets
+    while (idx < 34) {
+        frame[idx++] = 0x00;
+    }
+
+    // Log de la trame pour débogage
+    ESP_LOGI(TAG, "HVAC OFF trame envoyée au w100:");
+    ESP_LOG_BUFFER_HEX(TAG, frame, idx);
+
+    // Préparer l'attribut OCTET_STRING
+    uint8_t attr_buf[1 + idx];
+    attr_buf[0] = idx; // Longueur de la trame
+    memcpy(attr_buf + 1, frame, idx);
+
+    esp_zb_zcl_attribute_t attr = {
+        .id = 0xFFF2, // Attribut 65522
+        .data.type = ESP_ZB_ZCL_ATTR_TYPE_OCTET_STRING,
+        .data.value = attr_buf
+    };
+
+    esp_zb_zcl_write_attr_cmd_t cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = THERMOSTAT, // 0xDAEF
+            .dst_endpoint = 1, // Endpoint 1 du thermostat
+            .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT // Endpoint local
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = 0xFCC0, // Cluster manuSpecificLumi
+        .manuf_specific = 1,
+        .manuf_code = MANUFACTURER_CODE, // 0x115F
+        .attr_number = 1,
+        .attr_field = &attr
+    };
+
+    response_received = false;
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_write_attr_cmd_req(&cmd);
+    esp_zb_lock_release();
+
+    ESP_LOGI(TAG, "HVAC OFF command sent to Aqara W100 (0x%04x, endpoint 1, cluster 0xFCC0)", THERMOSTAT);
+
+    // Attendre une réponse ZCL
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    read_thermostat_attributes_pmtsd();
+
+}
+
+static void send_pmtsd_command(void) {
+    // Adresses MAC
+    uint8_t hub_mac[] = {0x54, 0xEF, 0x44, 0x80, 0x71, 0x1A}; // Hub/Coordinateur
+
+    // Paramètres PMTSD (valeurs fixes pour correspondre à l'exemple)
+    uint8_t power = 0;   // Thermostat ON
+    uint8_t mode = 1;    // Heating
+    uint8_t temp = 19;   // 19°C
+    uint8_t speed = 0;   // Fan Auto
+    uint8_t display = 0; // Unknown, default 0
+
+    ESP_LOGI(TAG, "Setting PMTSD: Power=%d, Mode=%d, Temp=%d, Speed=%d, Display=%d", power, mode, temp, speed, display);
+
+    // Construire la chaîne PMTSD
+    char pmtsd_str[32];
+    snprintf(pmtsd_str, sizeof(pmtsd_str), "P%d_M%d_T%d_S%d_D%d", power, mode, temp, speed, display);
+    uint8_t pmtsd_bytes[32];
+    uint8_t pmtsd_len = strlen(pmtsd_str);
+    for (uint8_t i = 0; i < pmtsd_len; i++) {
+        pmtsd_bytes[i] = pmtsd_str[i];
+    }
+
+    // Construire la trame
+    uint8_t frame[64];
+    uint8_t idx = 0;
+
+    // En-tête fixe aligné sur Zigbee2MQTT
+    uint8_t fixed_header[] = {
+        0xAA, 0x71, 0x1F, 0x44, // Préfixe Lumi
+        0x00, // Counter (rempli plus tard)
+        0x00, // Checksum (rempli plus tard)
+        0x05, 0x41, 0x1C, // Action et en-tête
+        0x00, 0x00, // Réservé
+        0x54, 0xEF, 0x44, 0x80, 0x71, 0x1A, // Adresse MAC du hub
+        0x08, 0x00, 0x08, 0x44, // Suffixe
+        pmtsd_len // Longueur PMTSD
+    };
+    uint8_t counter = (uint8_t)(esp_random() & 0xFF);
+    fixed_header[4] = counter;
+
+    // Copier l'en-tête
+    for (uint8_t i = 0; i < sizeof(fixed_header); i++) {
+        frame[idx++] = fixed_header[i];
+    }
+
+    // Ajouter la charge utile PMTSD
+    for (uint8_t i = 0; i < pmtsd_len; i++) {
+        frame[idx++] = pmtsd_bytes[i];
+    }
+
+    // Calculer le checksum
+    uint8_t checksum = 0;
+    for (uint8_t i = 0; i < idx; i++) {
+        checksum = (checksum + frame[i]) & 0xFF;
+    }
+    frame[5] = checksum;
+
+    // Log de la trame pour débogage
+    ESP_LOGI(TAG, "Set PMTSD trame envoyée au W100:");
+    ESP_LOG_BUFFER_HEX(TAG, frame, idx);
+
+    // Préparer l'attribut OCTET_STRING
+    uint8_t attr_buf[1 + idx];
+    attr_buf[0] = idx; // Longueur de la chaîne OCTET_STRING
+    memcpy(attr_buf + 1, frame, idx);
+
+    esp_zb_zcl_attribute_t attr = {
+        .id = 0xFFF2,
+        .data.type = ESP_ZB_ZCL_ATTR_TYPE_OCTET_STRING,
+        .data.value = attr_buf
+    };
+
+    esp_zb_zcl_write_attr_cmd_t cmd = {
+        .zcl_basic_cmd = {
+            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_endpoint = 1,
+            .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
+        },
+        .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID = 0xFCC0,
+        .manuf_specific = 1,
+        .manuf_code = MANUFACTURER_CODE,
+        .attr_number = 1,
+        .attr_field = &attr,
+    };
+
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_write_attr_cmd_req(&cmd);
+    esp_zb_lock_release();
+
+    read_thermostat_attributes_pmtsd();
+}
+
 /* Fonction pour construire le header Lumi */
 static uint8_t construct_lumi_header(uint8_t *header, uint8_t counter, uint8_t params_length, uint8_t action) {
     header[0] = 0xAA;
@@ -1672,7 +2121,7 @@ static void set_external_humidity(uint8_t battery_percent) {
     union { float fl; uint32_t u; } fu;
     fu.fl = f;
     uint8_t humi_buf[4] = { (fu.u >> 24) & 0xFF, (fu.u >> 16) & 0xFF, (fu.u >> 8) & 0xFF, fu.u & 0xFF };
-    ESP_LOGI(TAG, "Setpoint batterie value: %.2f, encoded as: %02x %02x %02x %02x", 
+    ESP_LOGI(TAG, "Batterie value: %.2f, encoded as: %02x %02x %02x %02x", 
              f, humi_buf[0], humi_buf[1], humi_buf[2], humi_buf[3]);
 
     /* Params */
@@ -1722,7 +2171,7 @@ static void set_external_humidity(uint8_t battery_percent) {
     esp_zb_zcl_write_attr_cmd_req(&cmd);
     esp_zb_lock_release();
 
-    ESP_LOGI(TAG, "External temperature (setpoint) défini sur %d.%d °C, TSN unknown", battery_percent / 100, abs(battery_percent % 100));
+    ESP_LOGI(TAG, "Batterie défini sur %d.%d %%, TSN unknown", battery_percent / 100, abs(battery_percent % 100));
 }
 
 void watchdog_task(void *pvParameters)
