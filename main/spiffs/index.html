@@ -86,8 +86,28 @@
             <button onclick="sendHvacOFF()">Mode HVAC OFF</button>
         </div>
         <div class="input-group">
+            <label for="p_pmtsd">Power (0=ON, 1=OFF):</label>
+            <input type="number" id="p_pmtsd" value="0">
+        </div>
+        <div class="input-group">
+            <label for="m_pmtsd">Mode (0=Cooling, 1=Heating, 2=Auto):</label>
+            <input type="number" id="m_pmtsd" value="1">
+        </div>
+        <div class="input-group">
+            <label for="t_pmtsd">Température:</label>
+            <input type="number" id="t_pmtsd" value="20.5" step="0.1">
+        </div>
+        <div class="input-group">
+            <label for="s_pmtsd">Speed (de 0 auto à 4):</label>
+            <input type="number" id="s_pmtsd" value="0">
+        </div>
+        <div class="input-group">
+            <label for="d_pmtsd">D = à définir... 0 ou 1:</label>
+            <input type="number" id="d_pmtsd" value="0">
+        </div>
+        <div class="input-group">
             <label>Rangée Centrale (PMTSD):</label>
-            <button onclick="sendPmtsd()">Activer PMTSD</button>
+            <button onclick="sendPmtsd()">Envoyer PMTSD</button>
         </div>
         <div class="input-group">
             <label for="operating_time">Temps de fonctionnement :</label> <span id="operating_time"> 0j 00h 00mn </span>
@@ -329,33 +349,57 @@ function sendHvacOn() {
         });
     }
 
-    function sendPmtsd() {
-        fetch('/pmtsd', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: ''
-        })
-        .then(response => {
-            if (!response.ok) throw new Error('PMTSD failed ' + response.status);
-            return response.text();
-        })
-        .then(text => {
-            try {
-                const data = JSON.parse(text);
-                document.getElementById('update_status').textContent = data.status || 'PMTSD command sent';
-                setTimeout(() => {
-                    document.getElementById('update_status').textContent = '';
-                }, 5000);
-            } catch (e) {
-                console.error('Invalid JSON from /pmtsd:', text, e);
-                document.getElementById('update_status').textContent = 'Error: Invalid response from /pmtsd';
-            }
-        })
-        .catch(error => {
-            console.error('Error sending PMTSD:', error);
-            document.getElementById('update_status').textContent = 'Error: Failed to send PMTSD command';
-        });
+function sendPmtsd() {
+    console.log('sendPmtsd called'); // Log pour vérifier que la fonction est appelée
+    const p_pmtsd = parseInt(document.getElementById('p_pmtsd').value);
+    const m_pmtsd = parseInt(document.getElementById('m_pmtsd').value);
+    const t_pmtsd = parseFloat(document.getElementById('t_pmtsd').value);
+    const s_pmtsd = parseInt(document.getElementById('s_pmtsd').value);
+    const d_pmtsd = parseInt(document.getElementById('d_pmtsd').value);
+
+    // Validation des entrées
+    if (isNaN(p_pmtsd) || isNaN(m_pmtsd) || isNaN(t_pmtsd) || isNaN(s_pmtsd) || isNaN(d_pmtsd)) {
+        console.error('Invalid input: All PMTSD fields must be valid numbers');
+        document.getElementById('update_status').textContent = 'Erreur : Tous les champs PMTSD doivent être remplis avec des nombres valides';
+        return;
     }
+    if (p_pmtsd < 0 || p_pmtsd > 1 || m_pmtsd < 0 || m_pmtsd > 2 || t_pmtsd < 5.0 || t_pmtsd > 30.0 || s_pmtsd < 0 || s_pmtsd > 4 || d_pmtsd < 0) {
+        console.error('Invalid range: P(0-1), M(0-2), T(5.0-30.0), S(0-4), D(0-1)', { p_pmtsd, m_pmtsd, t_pmtsd, s_pmtsd, d_pmtsd });
+        document.getElementById('update_status').textContent = 'Erreur : Valeurs PMTSD hors des plages valides (P:0-1, M:0-2, T:5.0-30.0, S:0-4, D:0-1)';
+        return;
+    }
+
+    const body = `p_pmtsd=${encodeURIComponent(p_pmtsd)}&m_pmtsd=${encodeURIComponent(m_pmtsd)}&t_pmtsd=${encodeURIComponent(t_pmtsd)}&s_pmtsd=${encodeURIComponent(s_pmtsd)}&d_pmtsd=${encodeURIComponent(d_pmtsd)}`;
+    console.log('Sending POST to /pmtsd with body:', body);
+
+    fetch('/pmtsd', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body
+    })
+    .then(response => {
+        console.log('Response status:', response.status);
+        if (!response.ok) throw new Error('PMTSD failed: ' + response.status);
+        return response.text();
+    })
+    .then(text => {
+        console.log('Response text:', text);
+        try {
+            const data = JSON.parse(text);
+            document.getElementById('update_status').textContent = data.status || 'Commande PMTSD envoyée';
+            setTimeout(() => {
+                document.getElementById('update_status').textContent = '';
+            }, 5000);
+        } catch (e) {
+            console.error('Invalid JSON from /pmtsd:', text, e);
+            document.getElementById('update_status').textContent = 'Erreur : Réponse invalide depuis /pmtsd';
+        }
+    })
+    .catch(error => {
+        console.error('Error sending PMTSD:', error);
+        document.getElementById('update_status').textContent = 'Erreur : Échec de l\'envoi de la commande PMTSD - ' + error.message;
+    });
+}
 
     fetchData();
     update_operating_time();
