@@ -27,7 +27,7 @@
 #define RELAY_CHAUFF                    0xB377      /* Relay for chauffage */
 #define RELAY_BINDING_EP                1           /* Endpoint for binding to the relay */
 #define DEFAULT_OCCUPIED_HEATING_SETPOINT 2100      /* en centièmes de degré */
-#define THERMOSTAT                      0x61C6      /* Thermostat device ID SMABIT = 0xD5AA Aqara W100 = 0x61C6 */
+#define THERMOSTAT                      0xC0E4      /* Thermostat device ID SMABIT = 0xD5AA Aqara W100 = 0xC0E4 */
 #define THERMOSTAT_IEEE                 {0x54, 0xEF, 0x44, 0x10, 0x01, 0x26, 0x3E, 0xF3} /* IEEE address of the thermostat */
 #define HUB_IEEE                        {0x54, 0xEF, 0x44, 0x80, 0x71, 0x1A} // Adresse MAC d'un hub M3 aqara, NE PAS MODIFIER
 #define HYSTERESIS_MOINS                10          /* Hysteresis inférieur en centièmes de degré */
@@ -36,7 +36,8 @@
 #define MAX_RETRIES                     3           // Nombre maximum de tentatives
 
 /* Configuration par défaut */
-#define SETPOINT_DEFAULT                1900        // setpoint par défaut pour le premier lancement
+#define HEATING_SETPOINT_DEFAULT        1900        // heating setpoint par défaut pour le premier lancement
+#define COOLING_SETPOINT_DEFAULT        3500        // cooling setpoint par défaut pour le premier lancement
 #define HIGH_HYST_DEFAULT               10          // Hysteresis supérieur par défaut en centièmes de degré
 #define LOW_HYST_DEFAULT                10          // Hysteresis inférieur par défaut en centièmes de degré
 
@@ -44,8 +45,8 @@
 #define ZCL_THERMOSTAT_ATTR_RELAY_STATE          0xF000
 
 /* Basic manufacturer information */
-#define ESP_MANUFACTURER_NAME "\x09""ESPRESSIF"         /* Customized manufacturer name */
-#define ESP_MODEL_IDENTIFIER "\x07"CONFIG_IDF_TARGET    /* Customized model identifier */
+#define ESP_MANUFACTURER_NAME "\x08""@Noyax37"         /* Customized manufacturer name */
+#define ESP_MODEL_IDENTIFIER "\x0F""Thermostat_W100"    /* Customized model identifier */
 
 #define ESP_ZB_ZR_CONFIG()                                       \
     {                                                           \

@@ -31,6 +31,7 @@
 <body>
     <div class="container">
         <h1>Thermostat Control V1.0</h1>
+        <a href="/parametres">Aller aux paramètres</a>
         <div id="errorMessage" class="error-message">
             <span id="errorMessageText"></span>
         </div>
@@ -77,6 +78,8 @@
             <input type="number" id="new_low_hyst" step="0.1" value="0.1">
             <button onclick="startUpdateLowHysteresis()">Mise à jour Hysteresis -</button>
         </div>
+        <h4>Pour l'instant les données ci dessous sont fonctionnelles mais ne sont pas utilisées pour la fonction thermostat</h4>
+        <h4>     en attendant une éventuelle mise à jour du firmware du w100 qui autoriserait les chiffres à virgule en setpoint</h4>
         <div class="input-group">
             <label>Mode HVAC:</label>
             <button onclick="sendHvacOn()">Mode HVAC ON</button>

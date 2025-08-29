@@ -39,7 +39,8 @@ static const char *TAG = "ESP_ZIGBEE_CHAUFFAGE";
 // Variables globales
 int16_t last_temperature = INT16_MIN;
 int16_t last_humidity = INT16_MIN;
-int16_t last_setpoint = INT16_MIN; // Maintenu localement
+int16_t last_heating_setpoint = INT16_MIN; // Maintenu localement
+int16_t last_cooling_setpoint = COOLING_SETPOINT_DEFAULT;
 int16_t input_setpoint = INT16_MIN;
 uint16_t input_high_hyst = HIGH_HYST_DEFAULT;
 uint16_t input_low_hyst = LOW_HYST_DEFAULT;
@@ -48,7 +49,7 @@ static char *update_status = NULL;
 static char *status = NULL;
 static char *operating_time = NULL; // Format: "Xd Yh Zm"
 static uint8_t last_command_sent = 0xFF;
-
+static uint8_t tsn_counter = 0;
 static int s_retry_num = 0;
 static bool wifi_failed = false;
 static TaskHandle_t zb_task_handle = NULL;
@@ -107,7 +108,7 @@ static void save_settings_to_nvs(void) {
         return;
     }
 
-    err = nvs_set_i16(nvs_handle, "setpoint", last_setpoint);
+    err = nvs_set_i16(nvs_handle, "setpoint", last_heating_setpoint);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to save setpoint: %s", esp_err_to_name(err));
     }
@@ -129,7 +130,7 @@ static void save_settings_to_nvs(void) {
 
     nvs_close(nvs_handle);
     ESP_LOGI(TAG, "Settings saved to NVS: setpoint=%d, high_hyst=%u, low_hyst=%u", 
-             last_setpoint, input_high_hyst, input_low_hyst);
+             last_heating_setpoint, input_high_hyst, input_low_hyst);
 }
 
 static void load_settings_from_nvs(void) {
@@ -139,16 +140,16 @@ static void load_settings_from_nvs(void) {
     err = nvs_open("storage", NVS_READONLY, &nvs_handle);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to open NVS: %s, using default settings", esp_err_to_name(err));
-        last_setpoint = SETPOINT_DEFAULT; // 19.0°C
+        last_heating_setpoint = HEATING_SETPOINT_DEFAULT; // 19.0°C
         input_high_hyst = HIGH_HYST_DEFAULT; // 0.1°C
         input_low_hyst = LOW_HYST_DEFAULT;  // 0.1°C
         return;
     }
 
-    err = nvs_get_i16(nvs_handle, "setpoint", &last_setpoint);
+    err = nvs_get_i16(nvs_handle, "setpoint", &last_heating_setpoint);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read setpoint: %s, using default (%u)", esp_err_to_name(err), SETPOINT_DEFAULT);
-        last_setpoint = SETPOINT_DEFAULT; 
+        ESP_LOGW(TAG, "Failed to read setpoint: %s, using default (%u)", esp_err_to_name(err), HEATING_SETPOINT_DEFAULT);
+        last_heating_setpoint = HEATING_SETPOINT_DEFAULT; 
     }
 
     err = nvs_get_u16(nvs_handle, "high_hyst", &input_high_hyst);
@@ -165,7 +166,7 @@ static void load_settings_from_nvs(void) {
 
     nvs_close(nvs_handle);
     ESP_LOGI(TAG, "Settings loaded from NVS: setpoint=%d, high_hyst=%u, low_hyst=%u", 
-             last_setpoint, input_high_hyst, input_low_hyst);
+             last_heating_setpoint, input_high_hyst, input_low_hyst);
 }
 
 static void bdb_start_top_level_commissioning_wrapper(uint8_t mode_mask)
@@ -178,6 +179,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     uint32_t *p_sg_p = signal_struct->p_app_signal;
     esp_err_t err_status = signal_struct->esp_err_status;
     esp_zb_app_signal_type_t sig_type = *p_sg_p;
+    ESP_LOGI(TAG, "Zigbee signal received: %s, Status: %s (0x%x)", esp_zb_zdo_signal_to_string(sig_type), esp_err_to_name(err_status), err_status);
 
     /* Gestion des signaux BDB */
     switch (sig_type) {
@@ -190,9 +192,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                     esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
             set_sensor_mode("external");  /* Activer le mode external au démarrage */
             read_thermostat_attributes();
-            if (last_setpoint != INT16_MIN) {
-                ESP_LOGI(TAG, "Applying setpoint from NVS: %.1f °C", last_setpoint / 100.0);
-                set_external_temperature(last_setpoint);
+            if (last_heating_setpoint != INT16_MIN) {
+                ESP_LOGI(TAG, "Applying setpoint from NVS: %.1f °C", last_heating_setpoint / 100.0);
+                set_external_temperature(last_heating_setpoint);
             }
             // Mettre le relais à OFF après l'initialisation Zigbee
             send_on_off_command(ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID);
@@ -200,7 +202,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             // Activer le mode HVAC ON sur l'Aqara W100
             send_hvac_on_command();
             // Activer la rangée centrale avec PMTSD
-            send_pmtsd_command(0, 1, (float)last_setpoint / 100.0, 0, 1);
+            send_pmtsd_command(0, 1, (float)last_heating_setpoint / 100.0, 0, 1);
             // Mettre l'humidité ext à 0 (provisoire)
             set_external_humidity(0);
             zigbee_network_initialized = true;
@@ -237,6 +239,39 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         esp_zb_zcl_read_attr_cmd_req(&read_cmd);
         ESP_LOGI(TAG, "Sent read request for mode attribute (0x0172)");
         break;
+    case ZB_ZCL_CMD_WRITE_ATTRIB:
+        ESP_LOGI(TAG, "Write attribute command received, processing...");
+        esp_zb_zcl_write_attr_cmd_t *write_cmd = (esp_zb_zcl_write_attr_cmd_t *)signal_struct->p_app_signal;
+        for (uint8_t i = 0; i < write_cmd->attr_number; i++) {
+            if (write_cmd->attr_field[i].id == ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID) {
+                last_heating_setpoint = *(int16_t *)write_cmd->attr_field[i].data.value;
+                ESP_LOGI(TAG, "Updated occupied_heating_setpoint to %.1f°C", last_heating_setpoint / 100.0);
+                set_external_temperature(last_heating_setpoint); // Appliquer la nouvelle valeur
+            }
+        }
+        // Préparer et envoyer la réponse par défaut
+        uint8_t seq_num = tsn_counter++;
+        if (seq_num == 254) seq_num = 0;
+        zb_bufid_t resp_buffer = zb_buf_get_out();
+        if (resp_buffer) {
+            ZB_ZCL_SEND_DEFAULT_RESP_EXT(
+                resp_buffer,
+                write_cmd->zcl_basic_cmd.dst_addr_u.addr_short,         // _dst_addr
+                ZB_APS_ADDR_MODE_16_ENDP_PRESENT,                       // _dst_addr_mode
+                write_cmd->zcl_basic_cmd.dst_endpoint,                  // _dst_ep
+                write_cmd->zcl_basic_cmd.src_endpoint,                  // _src_ep
+                ZB_AF_HA_PROFILE_ID,                                   // _prof_id (Home Automation)
+                ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,                      // _cluster_id
+                seq_num,                                               // _seq_num (corrigé via contexte)
+                ZB_ZCL_CMD_WRITE_ATTRIB,                               // _cmd
+                ZB_ZCL_STATUS_SUCCESS,                                 // _status_code
+                ZB_ZCL_FRAME_DIRECTION_TO_SRV,                         // _direction (réponse au serveur)
+                0,                                                     // _is_manuf_specific
+                0,                                                     // _manuf_code
+                NULL                                                   // _callback
+            );
+        }
+        break;
     default:
         /* Gestion des commandes ZCL */
         if (sig_type == ZB_ZCL_CMD_READ_ATTRIB_RESP) {
@@ -269,8 +304,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             /* Les valeurs d'attributs doivent être parsées séparément via esp_zb_zcl_attribute_t */
             /* Exemple : utiliser ZB_ZCL_GET_ATTRIBUTE_VALUE si disponible */
         } else {
-            ESP_LOGI(TAG, "Unknown signal: %s (0x%x), status: %s (0x%x)", 
-                     esp_zb_zdo_signal_to_string(sig_type), sig_type, esp_err_to_name(err_status), err_status);
+            ESP_LOGI(TAG, "Unknown signal: %s (0x%x), status: %s (0x%x), payload ptr: %p, signal_struct ptr: %p", 
+                     esp_zb_zdo_signal_to_string(sig_type), sig_type, esp_err_to_name(err_status), err_status, signal_struct->p_app_signal, signal_struct);
         }
         break;
     }
@@ -487,11 +522,11 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
                 if (button_value == 1) {
                     if (message->src_endpoint == 1) {
                         ESP_LOGI(TAG, "Button + pressed (single_plus, endpoint 1)");
-                        if (last_setpoint != INT16_MIN) {
-                            int16_t new_setpoint = last_setpoint + 10; // Augmenter de 0.1°C
+                        if (last_heating_setpoint != INT16_MIN) {
+                            int16_t new_setpoint = last_heating_setpoint + 10; // Augmenter de 0.1°C
                             set_external_temperature(new_setpoint);
                             send_pmtsd_command(0, 1, (float) new_setpoint / 100.0, 0, 1);
-                            last_setpoint = new_setpoint;
+                            last_heating_setpoint = new_setpoint;
                             save_settings_to_nvs();
                             ESP_LOGI(TAG, "Setpoint increased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
                         }
@@ -502,11 +537,11 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
                         read_relay_state();
                     } else if (message->src_endpoint == 3) {
                         ESP_LOGI(TAG, "Button - pressed (single_minus, endpoint 3)");
-                        if (last_setpoint != INT16_MIN) {
-                            int16_t new_setpoint = last_setpoint - 10; // Diminuer de 0.1°C
+                        if (last_heating_setpoint != INT16_MIN) {
+                            int16_t new_setpoint = last_heating_setpoint - 10; // Diminuer de 0.1°C
                             set_external_temperature(new_setpoint);
                             send_pmtsd_command(0, 1, (float) new_setpoint / 100.0, 0, 1);
-                            last_setpoint = new_setpoint;
+                            last_heating_setpoint = new_setpoint;
                             save_settings_to_nvs();
                             ESP_LOGI(TAG, "Setpoint decreased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
                         }
@@ -515,20 +550,20 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
             }
         } else if (message->cluster == ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID) {
-                last_setpoint = *(int16_t *)message->attribute.data.value;
+                last_heating_setpoint = *(int16_t *)message->attribute.data.value;
                 ESP_LOGI(TAG, "Thermostat 0x%04x Setpoint: %d.%d °C", 
                         message->src_address.u.short_addr, 
-                        last_setpoint / 100, abs(last_setpoint % 100));
+                        last_heating_setpoint / 100, abs(last_heating_setpoint % 100));
             } else if (message->attribute.id == ESP_ZB_ZCL_ATTR_THERMOSTAT_LOCAL_TEMPERATURE_ID) {
                 last_temperature = *(int16_t *)message->attribute.data.value;
                 ESP_LOGI(TAG, "Thermostat 0x%04x Local Temperature: %d.%d °C", 
                         message->src_address.u.short_addr, 
                         last_temperature / 100, abs(last_temperature % 100));
             } else if (message->attribute.id == ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_ID) {
-                int16_t cooling_setpoint = *(int16_t *)message->attribute.data.value;
+                last_cooling_setpoint = *(int16_t *)message->attribute.data.value;
                 ESP_LOGI(TAG, "Thermostat 0x%04x Cooling Setpoint: %d.%d °C", 
                         message->src_address.u.short_addr, 
-                        cooling_setpoint / 100, abs(cooling_setpoint % 100));
+                        last_cooling_setpoint / 100, abs(last_cooling_setpoint % 100));
             }
         }
 
@@ -557,19 +592,19 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
 
 static void test_setpoint(void)
 {
-        // Logique du relais avec last_setpoint, input_high_hyst et input_low_hyst
-        if (last_temperature != INT16_MIN && last_setpoint != INT16_MIN && 
+        // Logique du relais avec last_heating_setpoint, input_high_hyst et input_low_hyst
+        if (last_temperature != INT16_MIN && last_heating_setpoint != INT16_MIN && 
             input_high_hyst != 0 && input_low_hyst != 0) {
-            if (last_temperature <= last_setpoint - (int16_t)input_low_hyst) {
+            if (last_temperature <= last_heating_setpoint - (int16_t)input_low_hyst) {
                 send_on_off_command(ESP_ZB_ZCL_CMD_ON_OFF_ON_ID);
                 read_relay_state();
-            } else if (last_temperature >= last_setpoint + (int16_t)input_high_hyst) {
+            } else if (last_temperature >= last_heating_setpoint + (int16_t)input_high_hyst) {
                 send_on_off_command(ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID);
                 read_relay_state();
             }
         } else {
             ESP_LOGI(TAG, "Waiting for all data: temp=%d, setpoint=%d, high_hyst=%u, low_hyst=%u",
-                     last_temperature, last_setpoint, input_high_hyst, input_low_hyst);
+                     last_temperature, last_heating_setpoint, input_high_hyst, input_low_hyst);
         }
 
 }
@@ -601,7 +636,7 @@ static void write_thermostat_attributes(int16_t new_setpoint, uint16_t new_high_
     if (setpoint_updated) {
         set_external_temperature(new_setpoint);
         send_pmtsd_command(0, 1, (float)(new_setpoint) / 100.0, 0, 1);
-        last_setpoint = new_setpoint; // Mettre à jour localement
+        last_heating_setpoint = new_setpoint; // Mettre à jour localement
         save_settings_to_nvs(); // Sauvegarder dans NVS
         test_setpoint();
         asprintf(&update_status, "Setpoint modifié avec succès");
@@ -709,7 +744,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                     if (data_len >= 4 && data[data_len - 4] == 0x08 && data[data_len - 3] == 0x00 &&
                         data[data_len - 2] == 0x08 && data[data_len - 1] == 0x44) {
                         ESP_LOGI(TAG, "Detected PMTSD request, sending response");
-                        send_pmtsd_command(0, 1, (float) last_setpoint / 100.0, 0, 1);
+                        send_pmtsd_command(0, 1, (float) last_heating_setpoint / 100.0, 0, 1);
                     } else {
                         // Tenter de décoder comme ASCII (PMTSD)
                         char pmtsd_str[32] = {0};
@@ -921,7 +956,7 @@ static esp_err_t get_handler(httpd_req_t *req)
     char temp_str[16], humi_str[16], setpoint_str[16], relay_str[4], running_state_str[5];
     snprintf(temp_str, sizeof(temp_str), "%.1f", last_temperature != INT16_MIN ? last_temperature / 100.0 : 0.0);
     snprintf(humi_str, sizeof(humi_str), "%.1f", last_humidity != INT16_MIN ? last_humidity / 100.0 : 0.0);
-    snprintf(setpoint_str, sizeof(setpoint_str), "%.1f", last_setpoint != INT16_MIN ? last_setpoint / 100.0 : 0.0);
+    snprintf(setpoint_str, sizeof(setpoint_str), "%.1f", last_heating_setpoint != INT16_MIN ? last_heating_setpoint / 100.0 : 0.0);
     snprintf(relay_str, sizeof(relay_str), "%s", last_command_sent == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID ? "ON" : "OFF");
 
     int res_len = snprintf(updated_response, 30000,
@@ -1016,7 +1051,7 @@ static esp_err_t post_handler(httpd_req_t *req)
     }
 
     char setpoint_str[16], high_hyst_str[16], low_hyst_str[16];
-    int16_t new_setpoint = last_setpoint;
+    int16_t new_setpoint = last_heating_setpoint;
     uint16_t new_high_hyst = input_high_hyst;
     uint16_t new_low_hyst = input_low_hyst;
     bool setpoint_updated = false;
@@ -1102,7 +1137,7 @@ static esp_err_t data_handler(httpd_req_t *req)
 {
     static int16_t last_temperature_sent = INT16_MIN;
     static int16_t last_humidity_sent = INT16_MIN;
-    static int16_t last_setpoint_sent = INT16_MIN;
+    static int16_t last_heating_setpoint_sent = INT16_MIN;
     static uint8_t last_relay_actual_state_sent = 0xFF;
     static uint16_t last_high_hyst_sent = 0;
     static uint16_t last_low_hyst_sent = 0;
@@ -1113,7 +1148,7 @@ static esp_err_t data_handler(httpd_req_t *req)
     if (first_request || 
         last_temperature_sent != last_temperature ||
         last_humidity_sent != last_humidity ||
-        last_setpoint_sent != last_setpoint ||
+        last_heating_setpoint_sent != last_heating_setpoint ||
         last_relay_actual_state_sent != relay_actual_state ||
         last_high_hyst_sent != input_high_hyst ||
         last_low_hyst_sent != input_low_hyst ||
@@ -1133,7 +1168,7 @@ static esp_err_t data_handler(httpd_req_t *req)
     char temp_str[16], humi_str[16], setpoint_str[16], relay_actual_str[16], relay_commanded_str[16], high_hyst_str[16], low_hyst_str[16];
     snprintf(temp_str, sizeof(temp_str), "%.1f", last_temperature != INT16_MIN ? last_temperature / 100.0 : 0.0);
     snprintf(humi_str, sizeof(temp_str), "%.1f", last_humidity != INT16_MIN ? last_humidity / 100.0 : 0.0);
-    snprintf(setpoint_str, sizeof(setpoint_str), "%.1f", last_setpoint != INT16_MIN ? last_setpoint / 100.0 : 0.0);
+    snprintf(setpoint_str, sizeof(setpoint_str), "%.1f", last_heating_setpoint != INT16_MIN ? last_heating_setpoint / 100.0 : 0.0);
     snprintf(relay_actual_str, sizeof(relay_actual_str), "%s", (relay_actual_state != 0xFF) ? 
              ((relay_actual_state == 1) ? "ON" : "OFF") : "N/A");
     snprintf(relay_commanded_str, sizeof(relay_commanded_str), "%s", (last_command_sent != 0xFF) ? 
@@ -1156,7 +1191,7 @@ static esp_err_t data_handler(httpd_req_t *req)
     
     last_temperature_sent = last_temperature;
     last_humidity_sent = last_humidity;
-    last_setpoint_sent = last_setpoint;
+    last_heating_setpoint_sent = last_heating_setpoint;
     last_relay_actual_state_sent = relay_actual_state;
     last_high_hyst_sent = input_high_hyst;
     last_low_hyst_sent = input_low_hyst;
@@ -1532,6 +1567,18 @@ static void esp_zb_task(void *pvParameters)
         ESP_LOGE(TAG, "Failed to add Thermostat LocalTemperature attribute: status 0x%02x", status);
         return;
     }
+    int16_t min_heat_setpoint = ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_MIN_VALUE;
+    status = esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_server_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_MIN_HEAT_SETPOINT_LIMIT_ID, &min_heat_setpoint);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Thermostat OccupiedHeatingSetpointMin attribute: status 0x%02x", status);
+        return;
+    }
+    int16_t max_heat_setpoint = ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_MAX_VALUE;
+    status = esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_server_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_MAX_HEAT_SETPOINT_LIMIT_ID, &max_heat_setpoint);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Thermostat OccupiedHeatingSetpointMax attribute: status 0x%02x", status);
+        return;
+    }
     int16_t cool_setpoint = ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_DEFAULT_VALUE;
     status = esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_server_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_ID, &cool_setpoint);
     if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
@@ -1544,8 +1591,8 @@ static void esp_zb_task(void *pvParameters)
         ESP_LOGE(TAG, "Failed to add Thermostat OccupiedHeatingSetpoint attribute: status 0x%02x", status);
         return;
     }
-    int8_t sequence_operation = ESP_ZB_ZCL_THERMOSTAT_CONTROL_SEQ_OF_OPERATION_HEATING_ONLY; // Séquence d'opération par défaut chauffage seulement
-    status = esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_server_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_CONTROL_SEQUENCE_OF_OPERATION_ID, &sequence_operation);
+    int8_t running_state = 0; // Séquence d'opération par défaut chauffage seulement
+    status = esp_zb_thermostat_cluster_add_attr(esp_zb_thermostat_server_cluster, ESP_ZB_ZCL_ATTR_THERMOSTAT_THERMOSTAT_RUNNING_STATE_ID, &running_state);
     if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
         ESP_LOGE(TAG, "Failed to add Thermostat ControlSequenceOfOperation attribute: status 0x%02x", status);
         return;
@@ -1733,7 +1780,68 @@ static void update_server_attributes(void)
         ESP_LOGW(TAG, "Failed to update Thermostat LocalTemperature attribute: status 0x%02x", status);
     }
 
+    // mettre à jour l'attribut heating setpoint du cluster Thermostat serveur
+    int16_t heat_setpoint = (last_heating_setpoint != INT16_MIN && last_heating_setpoint >= 500) ? last_heating_setpoint : ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_DEFAULT_VALUE;
+    ESP_LOGI(TAG, "thermostat last heating setpoint = %d and heat setpoint = %d", last_heating_setpoint, heat_setpoint); // Log pour débogage
+    status = esp_zb_zcl_set_attribute_val(
+        HA_ONOFF_SWITCH_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_ID,
+        &heat_setpoint,
+        false
+    );
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "Failed to update Thermostat OccupiedHeatingSetpoint attribute: status 0x%02x", status);
+    }
 
+    // mettre à jour l'attibut cooling setpoint du cluster thermostat
+    if (((last_cooling_setpoint >= last_heating_setpoint) ? last_cooling_setpoint : ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_DEFAULT_VALUE) > 
+                ((last_heating_setpoint != INT16_MIN && last_heating_setpoint >= 500) ? last_heating_setpoint : ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_DEFAULT_VALUE)) {
+        int16_t cool_setpoint = (last_cooling_setpoint >= last_heating_setpoint) ? last_cooling_setpoint : ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_DEFAULT_VALUE;
+        ESP_LOGI(TAG, "thermostat last cooling setpoint = %d and cool setpoint = %d", last_cooling_setpoint, cool_setpoint); // Log pour débogage
+        status = esp_zb_zcl_set_attribute_val(
+            HA_ONOFF_SWITCH_ENDPOINT,
+            ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+            ESP_ZB_ZCL_ATTR_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_ID,
+            &cool_setpoint,
+            false
+        );
+        if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+            ESP_LOGW(TAG, "Failed to update Thermostat OccupiedCoolingSetpoint attribute: status 0x%02x", status);
+        }
+    } else {
+        ESP_LOGW(TAG, "Failed to update Thermostat OccupiedCoolingSetpoint incorrect value: last cooling setpoint %d must be >= last heating setpoint %d", last_cooling_setpoint, last_heating_setpoint);
+    }
+
+    // mettre à jour l'attribut SystemMode du cluster Thermostat serveur
+    int8_t sys_mode = ESP_ZB_ZCL_THERMOSTAT_SYSTEM_MODE_HEAT; // Mode système chauffage
+    status = esp_zb_zcl_set_attribute_val(
+        HA_ONOFF_SWITCH_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_THERMOSTAT_SYSTEM_MODE_ID,
+        &sys_mode,
+        false
+    );
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "Failed to update Thermostat SystemMode attribute: status 0x%02x", status);
+    }
+
+    // mettre à jour l'attribut RunningState du cluster Thermostat serveur
+    int8_t running_state = (relay_actual_state == 1) ? 1 : 0;
+    status = esp_zb_zcl_set_attribute_val(
+        HA_ONOFF_SWITCH_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_THERMOSTAT_THERMOSTAT_RUNNING_STATE_ID,
+        &running_state,
+        false
+    );
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "Failed to update Thermostat RunningState attribute: status 0x%02x", status);
+    }
 
     ESP_LOGI(TAG, "Updated server attributes: OnOff=%u, Temp=%d, Humidity=%u",
              on_off_value, temp_value, humidity_value);
@@ -1809,7 +1917,7 @@ static void send_hvac_on_command(void) {
 
     esp_zb_zcl_write_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT, // 0xDAEF
+            .dst_addr_u.addr_short = THERMOSTAT,
             .dst_endpoint = 1, // Endpoint 1 du thermostat
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT, // Endpoint local
         },
@@ -1903,7 +2011,7 @@ static void send_hvac_off_command(void)
 
     esp_zb_zcl_write_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT, // 0xDAEF
+            .dst_addr_u.addr_short = THERMOSTAT,
             .dst_endpoint = 1, // Endpoint 1 du thermostat
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT // Endpoint local
         },
@@ -2054,8 +2162,8 @@ static void set_sensor_mode(const char *mode) {
 
     uint8_t device_ieee[8] = THERMOSTAT_IEEE;
     uint8_t fictive_sensor[8] = {0x00, 0x15, 0x8D, 0x00, 0x01, 0x9D, 0x1B, 0x98};
-    uint8_t chinese_humi[6] = {0xE6, 0xB9, 0xBF, 0xE5, 0xBA, 0xA6};  /* "湿度" */
-    uint8_t chinese_temp[6] = {0xE6, 0xB8, 0xA9, 0xE5, 0xBA, 0xA6};  /* "温度" */
+    uint8_t chinese_humi[6] = {0xE6, 0xB9, 0xBF, 0xE5, 0xBA, 0xA6};
+    uint8_t chinese_temp[6] = {0xE6, 0xB8, 0xA9, 0xE5, 0xBA, 0xA6};
 
     /* Params pour humidity (0x15) */
     uint8_t params_humi[4 + 1 + 8 + 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 + 5 + 1 + 1 + 1 + 1];  /* Max size 45 */

@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Paramètres</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .input-group { margin: 10px 0; }
+        label { display: inline-block; width: 200px; }
+        input { padding: 5px; }
+        .button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Paramètres</h1>
+    <form id="configForm">
+        <div class="input-group">
+            <label for="ieeeAddr">Adresse IEEE du W100 (ex: 0x54ef441001263ef3):</label>
+            <input type="text" id="ieeeAddr" name="ieeeAddr" pattern="^0x[0-9a-fA-F]{16}$" required>
+        </div>
+        <div class="input-group">
+            <label for="shortAddrW100">Adresse courte du W100:</label>
+            <input type="text" id="shortAddrW100" name="shortAddrW100" pattern="^0x[0-9a-fA-F]{4}$" required>
+        </div>
+        <div class="input-group">
+            <label for="shortAddrRelay">Adresse courte du relais:</label>
+            <input type="text" id="shortAddrRelay" name="shortAddrRelay" pattern="^0x[0-9a-fA-F]{4}$" required>
+        </div>
+        <button type="button" class="button" onclick="saveConfig()">Sauvegarder</button>
+        <button type="button" class="button" onclick="cancelConfig()">Annuler</button>
+    </form>
+
+    <script>
+        function saveConfig() {
+            const ieeeAddr = document.getElementById('ieeeAddr').value;
+            const shortAddrW100 = document.getElementById('shortAddrW100').value;
+            const shortAddrRelay = document.getElementById('shortAddrRelay').value;
+
+            // Validation des entrées (déjà partiellement gérée par pattern)
+            if (!ieeeAddr.match(/^0x[0-9a-fA-F]{16}$/) || !shortAddrW100.match(/^0x[0-9a-fA-F]{4}$/) || !shortAddrRelay.match(/^0x[0-9a-fA-F]{4}$/)) {
+                alert("Veuillez entrer des adresses valides.");
+                return;
+            }
+
+            // Envoi des données au serveur pour sauvegarde en NVS
+            fetch('/saveConfig', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ieeeAddr, shortAddrW100, shortAddrRelay })
+            }).then(response => {
+                if (response.ok) {
+                    alert("Paramètres sauvegardés. Redémarrage en cours...");
+                    // Le serveur gérera le reboot
+                } else {
+                    alert("Erreur lors de la sauvegarde.");
+                }
+            }).catch(error => alert("Erreur : " + error));
+        }
+
+        function cancelConfig() {
+            window.location.href = '/';
+        }
+    </script>
+</body>
+</html>
