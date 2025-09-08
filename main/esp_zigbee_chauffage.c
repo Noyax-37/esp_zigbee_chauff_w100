@@ -200,9 +200,11 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             send_on_off_command(ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID);
             read_relay_state();
             // Activer le mode HVAC ON sur l'Aqara W100
-            send_hvac_on_command();
+            // send_hvac_on_command();
             // Activer la rangée centrale avec PMTSD
-            send_pmtsd_command(0, 1, (float)last_heating_setpoint / 100.0, 0, 1);
+            // send_pmtsd_command(0, 1, (float)last_heating_setpoint / 100.0, 0, 1);
+            // Mettre la temp ext au setpoint
+            set_external_temperature(last_heating_setpoint);
             // Mettre l'humidité ext à 0 (provisoire)
             set_external_humidity(0);
             zigbee_network_initialized = true;
@@ -1938,12 +1940,6 @@ static void send_hvac_on_command(void) {
 
     last_tsn = tsn;
     ESP_LOGI(TAG, "HVAC ON command sent to Aqara W100 (0x%04x, endpoint 1, cluster 0xFCC0), TSN: 0x%02x", THERMOSTAT, tsn);
-
-    // Attendre une réponse ZCL
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    read_thermostat_attributes_pmtsd();
-
 
 }
 
