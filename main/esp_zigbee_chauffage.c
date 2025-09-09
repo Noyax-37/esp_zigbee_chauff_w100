@@ -58,6 +58,15 @@ static bool zigbee_network_initialized = false;
 static bool update_status_allocated = false;
 static bool response_received = false;
 static uint8_t last_tsn = 0;
+static char ieee_addr_w100[20] = {0}; // Buffer pour "0x" + 16 caractères + \0
+static char ieee_addr_relay[20] = {0}; // Buffer pour "0x" + 16 caractères + \0
+static char short_addr_w100[10] = {0}; // Buffer pour "0x" + 4 caractères + \0
+static char short_addr_relay[10] = {0}; // Buffer pour "0x" + 4 caractères + \0
+static char mode[20] = {0}; // Buffer pour "router" ou "coordinator"
+static uint8_t ieee_addr_w100_bytes[8] = {0};
+static uint8_t ieee_addr_relay_bytes[8] = {0};
+static uint16_t short_addr_w100_value = 0;
+static uint16_t short_addr_relay_value = 0;
 
 /* Compteur global pour les headers Lumi */
 static uint8_t lumi_counter = 0x10;
@@ -95,8 +104,57 @@ static void send_pmtsd_command(uint8_t power, uint8_t mode, float temp, uint8_t 
 // //////////////////////////////////// fin tests /////////////////////////////////////
 
 
+esp_err_t convert_short_address(const char *addr_str, uint16_t *out_value) {
+    if (addr_str == NULL || strlen(addr_str) != 6 || strncmp(addr_str, "0x", 2) != 0) {
+        ESP_LOGE(TAG, "Invalid short address format: %s", addr_str ? addr_str : "NULL");
+        return ESP_FAIL;
+    }
 
+    const char *hex_str = addr_str + 2; // Passer après "0x"
+    char hex_buf[5] = {0}; // Buffer pour les 4 caractères + \0
+    strncpy(hex_buf, hex_str, 4);
 
+    // Convertir en majuscules pour uniformité
+    for (int i = 0; hex_buf[i]; i++) {
+        hex_buf[i] = toupper(hex_buf[i]);
+    }
+
+    *out_value = (uint16_t)strtol(hex_buf, NULL, 16);
+    if (*out_value == 0 && (hex_buf[0] != '0' || hex_buf[1] != '0' || hex_buf[2] != '0' || hex_buf[3] != '0')) {
+        ESP_LOGE(TAG, "Conversion failed for short address: %s", addr_str);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Converted short address: 0x%04x", *out_value);
+    return ESP_OK;
+}
+
+esp_err_t convert_ieee_address(const char *addr_str, uint8_t out_array[8]) {
+    if (addr_str == NULL || strlen(addr_str) != 18 || strncmp(addr_str, "0x", 2) != 0) {
+        ESP_LOGE(TAG, "Invalid IEEE address format: %s", addr_str ? addr_str : "NULL");
+        return ESP_FAIL;
+    }
+
+    const char *hex_str = addr_str + 2;
+    for (int i = 0; i < 8; i++) {
+        char byte_str[3] = {hex_str[i * 2], hex_str[i * 2 + 1], '\0'};
+        char byte_str_upper[3];
+        strcpy(byte_str_upper, byte_str);
+        for (int j = 0; byte_str_upper[j]; j++) {
+            byte_str_upper[j] = toupper(byte_str_upper[j]);
+        }
+        out_array[i] = (uint8_t)strtol(byte_str_upper, NULL, 16);
+        if (out_array[i] == 0 && (byte_str[0] != '0' || byte_str[1] != '0')) {
+            ESP_LOGE(TAG, "Conversion failed for byte %d: %s", i, byte_str);
+            return ESP_FAIL;
+        }
+    }
+
+    ESP_LOGI(TAG, "Converted IEEE address: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+             out_array[0], out_array[1], out_array[2], out_array[3],
+             out_array[4], out_array[5], out_array[6], out_array[7]);
+    return ESP_OK;
+}
 
 static void save_settings_to_nvs(void) {
     nvs_handle_t nvs_handle;
@@ -140,16 +198,21 @@ static void load_settings_from_nvs(void) {
     err = nvs_open("storage", NVS_READONLY, &nvs_handle);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to open NVS: %s, using default settings", esp_err_to_name(err));
-        last_heating_setpoint = HEATING_SETPOINT_DEFAULT; // 19.0°C
-        input_high_hyst = HIGH_HYST_DEFAULT; // 0.1°C
-        input_low_hyst = LOW_HYST_DEFAULT;  // 0.1°C
+        last_heating_setpoint = HEATING_SETPOINT_DEFAULT;
+        input_high_hyst = HIGH_HYST_DEFAULT;
+        input_low_hyst = LOW_HYST_DEFAULT;
+        strcpy(ieee_addr_w100, "");
+        strcpy(ieee_addr_relay, "");
+        strcpy(short_addr_w100, "");
+        strcpy(short_addr_relay, "");
+        strcpy(mode, "router"); // Default mode
         return;
     }
 
     err = nvs_get_i16(nvs_handle, "setpoint", &last_heating_setpoint);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to read setpoint: %s, using default (%u)", esp_err_to_name(err), HEATING_SETPOINT_DEFAULT);
-        last_heating_setpoint = HEATING_SETPOINT_DEFAULT; 
+        last_heating_setpoint = HEATING_SETPOINT_DEFAULT;
     }
 
     err = nvs_get_u16(nvs_handle, "high_hyst", &input_high_hyst);
@@ -164,9 +227,75 @@ static void load_settings_from_nvs(void) {
         input_low_hyst = LOW_HYST_DEFAULT;
     }
 
+    size_t len = sizeof(ieee_addr_w100);
+    err = nvs_get_str(nvs_handle, "ieee_addr_w100", ieee_addr_w100, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read ieee_addr_w100: %s, using empty string", esp_err_to_name(err));
+        strcpy(ieee_addr_w100, "");
+        memset(ieee_addr_w100_bytes, 0, sizeof(ieee_addr_w100_bytes));
+    } else {
+        ESP_LOGI(TAG, "Loaded ieee_addr_w100 from NVS: %s (len=%zu)", ieee_addr_w100, len);
+        if (convert_ieee_address(ieee_addr_w100, ieee_addr_w100_bytes) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert ieee_addr_w100");
+            memset(ieee_addr_w100_bytes, 0, sizeof(ieee_addr_w100_bytes));
+        }
+    }
+
+    len = sizeof(ieee_addr_relay);
+    err = nvs_get_str(nvs_handle, "ieee_addr_relay", ieee_addr_relay, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read ieee_addr_relay: %s, using empty string", esp_err_to_name(err));
+        strcpy(ieee_addr_relay, "");
+        memset(ieee_addr_relay_bytes, 0, sizeof(ieee_addr_relay_bytes));
+    } else {
+        ESP_LOGI(TAG, "Loaded ieee_addr_relay from NVS: %s (len=%zu)", ieee_addr_relay, len);
+        if (convert_ieee_address(ieee_addr_relay, ieee_addr_relay_bytes) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert ieee_addr_relay");
+            memset(ieee_addr_relay_bytes, 0, sizeof(ieee_addr_relay_bytes));
+        }
+    }
+
+    len = sizeof(short_addr_w100);
+    err = nvs_get_str(nvs_handle, "short_ad_w100", short_addr_w100, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read short_ad_w100: %s, using empty string", esp_err_to_name(err));
+        strcpy(short_addr_w100, "");
+        short_addr_w100_value = 0;
+    } else {
+        ESP_LOGI(TAG, "Loaded short_ad_w100 from NVS: %s (len=%zu)", short_addr_w100, len);
+        if (convert_short_address(short_addr_w100, &short_addr_w100_value) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert short_addr_w100");
+            short_addr_w100_value = 0;
+        }
+    }
+
+    len = sizeof(short_addr_relay);
+    err = nvs_get_str(nvs_handle, "short_ad_relay", short_addr_relay, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read short_ad_relay: %s, using empty string", esp_err_to_name(err));
+        strcpy(short_addr_relay, "");
+        short_addr_relay_value = 0;
+    } else {
+        ESP_LOGI(TAG, "Loaded short_ad_relay from NVS: %s (len=%zu)", short_addr_relay, len);
+        if (convert_short_address(short_addr_relay, &short_addr_relay_value) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert short_addr_relay");
+            short_addr_relay_value = 0;
+        }
+    }
+
+    len = sizeof(mode);
+    err = nvs_get_str(nvs_handle, "mode", mode, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read mode: %s, using default 'router'", esp_err_to_name(err));
+        strcpy(mode, "router");
+    }
+
     nvs_close(nvs_handle);
-    ESP_LOGI(TAG, "Settings loaded from NVS: setpoint=%d, high_hyst=%u, low_hyst=%u", 
-             last_heating_setpoint, input_high_hyst, input_low_hyst);
+
+    ESP_LOGI(TAG, "Settings loaded from NVS: setpoint=%d, high_hyst=%u, low_hyst=%u, "
+             "mode=%s, ieee_addr_w100=%s, ieee_addr_relay=%s, short_addr_w100=%s, short_addr_relay=%s",
+             last_heating_setpoint, input_high_hyst, input_low_hyst,
+             mode, ieee_addr_w100, ieee_addr_relay, short_addr_w100, short_addr_relay);
 }
 
 static void bdb_start_top_level_commissioning_wrapper(uint8_t mode_mask)
@@ -218,16 +347,16 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_ZDO_DEVICE_UNAVAILABLE:
         ESP_LOGW(TAG, "ZDO Device Unavailable detected, status: %s (0x%x)", esp_err_to_name(err_status), err_status);
         if (update_status && update_status_allocated) {
+            asprintf(&update_status, "Échec de l'écriture, périphérique indisponible");
             ESP_LOGI(TAG, "Freeing update_status at address %p due to device unavailability", update_status);
             free(update_status);
             update_status = NULL;
             update_status_allocated = false;
         }
-        asprintf(&update_status, "Échec de l'écriture, périphérique indisponible");
         update_status_allocated = true;
         esp_zb_zcl_read_attr_cmd_t read_cmd = {
             .zcl_basic_cmd = {
-                .dst_addr_u.addr_short = THERMOSTAT,
+                .dst_addr_u.addr_short = short_addr_w100_value,
                 .dst_endpoint = 1,
                 .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
             },
@@ -317,26 +446,26 @@ static void send_on_off_command(uint8_t command_id)
 {
     if (command_id == last_command_sent) {
         ESP_LOGI(TAG, "Skipping %s command to Shelly relay (0x%04x, endpoint %d): already in this state",
-                 (command_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", RELAY_CHAUFF, RELAY_BINDING_EP);
+                 (command_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", short_addr_relay_value, RELAY_BINDING_EP);
         return;
     }
 
     esp_zb_zcl_on_off_cmd_t cmd_req;
-    cmd_req.zcl_basic_cmd.dst_addr_u.addr_short = RELAY_CHAUFF;
+    cmd_req.zcl_basic_cmd.dst_addr_u.addr_short = short_addr_relay_value;
     cmd_req.zcl_basic_cmd.dst_endpoint = RELAY_BINDING_EP;
     cmd_req.zcl_basic_cmd.src_endpoint = HA_ONOFF_SWITCH_ENDPOINT;
     cmd_req.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
     cmd_req.on_off_cmd_id = command_id;
 
     ESP_LOGI(TAG, "Sending %s command to Shelly relay (0x%04x, endpoint %d)", 
-             (command_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", RELAY_CHAUFF, RELAY_BINDING_EP);
+             (command_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", short_addr_relay_value, RELAY_BINDING_EP);
 
     esp_zb_lock_acquire(portMAX_DELAY);
     uint8_t tsn = esp_zb_zcl_on_off_cmd_req(&cmd_req);
     esp_zb_lock_release();
 
     ESP_LOGI(TAG, "Sent %s command to Shelly relay (0x%04x, endpoint %d) with TSN 0x%02x", 
-             (command_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", RELAY_CHAUFF, RELAY_BINDING_EP, tsn);
+             (command_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", short_addr_relay_value, RELAY_BINDING_EP, tsn);
 
     last_command_sent = command_id;
 }
@@ -345,7 +474,7 @@ static void read_relay_state(void)
 {
     esp_zb_zcl_read_attr_cmd_t read_cmd = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = RELAY_CHAUFF,
+            .dst_addr_u.addr_short = short_addr_relay_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
@@ -364,7 +493,7 @@ static void read_thermostat_attributes_pmtsd(void)
     // Lecture du pmtsd
     esp_zb_zcl_read_attr_cmd_t cmd_pmtsd = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
@@ -385,7 +514,7 @@ static void read_thermostat_attributes(void)
     // Lecture de la température locale
     esp_zb_zcl_read_attr_cmd_t cmd_temp = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
@@ -401,7 +530,7 @@ static void read_thermostat_attributes(void)
     // Lecture de l'humidité
     esp_zb_zcl_read_attr_cmd_t cmd_humidity = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
@@ -417,7 +546,7 @@ static void read_thermostat_attributes(void)
     // Lecture du mode capteur 1
     esp_zb_zcl_read_attr_cmd_t cmd_specific_1 = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
@@ -433,7 +562,7 @@ static void read_thermostat_attributes(void)
     // Lecture du mode capteur 2
     esp_zb_zcl_read_attr_cmd_t cmd_specific_2 = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
@@ -450,7 +579,7 @@ static void read_thermostat_attributes(void)
     // Lecture du cluster thermostat
     esp_zb_zcl_read_attr_cmd_t cmd_thermostat = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
@@ -477,7 +606,7 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
             message->attribute.id, message->attribute.data.type, 
             message->attribute.data.value ? *(int16_t *)message->attribute.data.value : 0);
 
-    if (message->src_address.u.short_addr == THERMOSTAT) {
+    if (message->src_address.u.short_addr == short_addr_w100_value) {
         if (message->cluster == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID) {
                 last_temperature = *(int16_t *)message->attribute.data.value;
@@ -577,7 +706,7 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
         }
     }
 
-    if (message->src_address.u.short_addr == RELAY_CHAUFF && message->cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
+    if (message->src_address.u.short_addr == short_addr_relay_value && message->cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
         if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
             relay_actual_state = (*(uint8_t *)message->attribute.data.value != 0) ? 1 : 0;
             ESP_LOGI(TAG, "Relay 0x%04x On/Off state: %s", 
@@ -679,9 +808,9 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
         ESP_LOGI(TAG, "Received ZCL Default Response from address(0x%04x) endpoint(%d) cluster(0x%04x) command(0x%02x) status(0x%02x)",
                 resp->info.src_address.u.short_addr, resp->info.src_endpoint, resp->info.cluster, 
                 resp->resp_to_cmd, resp->status_code);
-        if (resp->info.src_address.u.short_addr == THERMOSTAT && resp->info.cluster == 0xFCC0) {
+        if (resp->info.src_address.u.short_addr == short_addr_w100_value && resp->info.cluster == 0xFCC0) {
             if (resp->status_code == 0) {
-                ESP_LOGI(TAG, "Write command to thermostat (0x%04x) succeeded", THERMOSTAT);
+                ESP_LOGI(TAG, "Write command to thermostat (0x%04x) succeeded", short_addr_w100_value);
                 if (update_status && update_status_allocated) {
                     ESP_LOGI(TAG, "Freeing update_status at address %p", update_status);
                     free(update_status);
@@ -695,7 +824,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                 xTaskCreate(reset_update_status_task, "Reset_Update_Status", 2048, NULL, 1, NULL);
                 read_thermostat_attributes();
             } else {
-                ESP_LOGE(TAG, "Write failed for thermostat (0x%04x), status: 0x%02x", THERMOSTAT, resp->status_code);
+                ESP_LOGE(TAG, "Write failed for thermostat (0x%04x), status: 0x%02x", short_addr_w100_value, resp->status_code);
                 if (update_status && update_status_allocated) {
                     ESP_LOGI(TAG, "Freeing update_status at address %p due to write failure", update_status);
                     free(update_status);
@@ -708,10 +837,10 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                 xTaskCreate(reset_update_status_task, "Reset_Update_Status", 2048, NULL, 1, NULL);
                 read_thermostat_attributes();
             }
-        } else if (resp->info.src_address.u.short_addr == RELAY_CHAUFF && resp->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
+        } else if (resp->info.src_address.u.short_addr == short_addr_relay_value && resp->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
             ESP_LOGI(TAG, "Command %s (0x%02x) to Relay (0x%04x) %s",
                     (resp->resp_to_cmd == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", resp->resp_to_cmd,
-                    RELAY_CHAUFF, (resp->status_code == 0) ? "succeeded" : "failed");
+                    short_addr_relay_value, (resp->status_code == 0) ? "succeeded" : "failed");
         }
         break;
     }
@@ -976,6 +1105,241 @@ static esp_err_t get_handler(httpd_req_t *req)
     httpd_resp_send(req, updated_response, strlen(updated_response));
     free(response);
     free(updated_response);
+    return ESP_OK;
+}
+
+static esp_err_t parametres_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "Received request for /parametres");
+
+    FILE *f = fopen("/spiffs/parametres.html", "r");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open parametres.html");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    rewind(f);
+    ESP_LOGI(TAG, "parametres.html size: %ld bytes", file_size);
+    if (file_size > 30000) {
+        ESP_LOGE(TAG, "parametres.html too large (%" PRId32 " bytes), max is 30000 bytes", (int32_t)file_size);
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    char *response = (char *)calloc(30000, 1);
+    if (response == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for response");
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    size_t len = fread(response, 1, 30000, f);
+    fclose(f);
+    ESP_LOGI(TAG, "Read %u bytes from parametres.html", len);
+
+    if (len <= 0) {
+        ESP_LOGE(TAG, "Failed to read parametres.html");
+        free(response);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    response[len] = '\0';
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, response, strlen(response));
+    free(response);
+    return ESP_OK;
+}
+
+static esp_err_t save_config_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "Received request for /saveConfig");
+
+    char buf[200];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        ESP_LOGE(TAG, "Failed to receive data");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    cJSON *json = cJSON_Parse(buf);
+    if (json == NULL) {
+        ESP_LOGE(TAG, "Failed to parse JSON");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    cJSON *mode = cJSON_GetObjectItem(json, "mode");
+    cJSON *ieeeAddrW100 = cJSON_GetObjectItem(json, "ieeeAddrW100");
+    cJSON *ieeeAddrRelay = cJSON_GetObjectItem(json, "ieeeAddrRelay");
+    cJSON *shortAddrW100 = cJSON_GetObjectItem(json, "shortAddrW100");
+    cJSON *shortAddrRelay = cJSON_GetObjectItem(json, "shortAddrRelay");
+
+    if (mode && ieeeAddrW100 && ieeeAddrRelay) {
+        nvs_handle_t nvs_handle;
+        esp_err_t err;
+        if (nvs_open("storage", NVS_READWRITE, &nvs_handle) == ESP_OK) {
+            // Lire le mode actuel pour comparaison
+            char current_mode[20] = {0};
+            size_t len = sizeof(current_mode);
+            err = nvs_get_str(nvs_handle, "mode", current_mode, &len);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Current mode not found, assuming no change");
+                strcpy(current_mode, ""); // Par défaut si non trouvé
+            }
+
+            // Sauvegarder les nouvelles valeurs
+            err = nvs_set_str(nvs_handle, "mode", mode->valuestring);
+            if (err != ESP_OK) ESP_LOGE(TAG, "Failed to set mode in NVS: %s", esp_err_to_name(err));
+            else ESP_LOGI(TAG, "Mode set: %s", mode->valuestring);
+
+            err = nvs_set_str(nvs_handle, "ieee_addr_w100", ieeeAddrW100->valuestring);
+            if (err != ESP_OK) ESP_LOGE(TAG, "Failed to set ieee_addr_w100 in NVS: %s", esp_err_to_name(err));
+            else ESP_LOGI(TAG, "IEEE W100 address set: %s", ieeeAddrW100->valuestring);
+
+            err = nvs_set_str(nvs_handle, "ieee_addr_relay", ieeeAddrRelay->valuestring);
+            if (err != ESP_OK) ESP_LOGE(TAG, "Failed to set ieee_addr_relay in NVS: %s", esp_err_to_name(err));
+            else ESP_LOGI(TAG, "IEEE Relay address set: %s", ieeeAddrRelay->valuestring);
+
+            if (cJSON_IsString(shortAddrW100) && cJSON_IsString(shortAddrRelay)) {
+                err = nvs_set_str(nvs_handle, "short_ad_w100", shortAddrW100->valuestring);
+                if (err != ESP_OK) ESP_LOGE(TAG, "Failed to set short_ad_w100 in NVS: %s", esp_err_to_name(err));
+                else ESP_LOGI(TAG, "Short W100 address set: %s", shortAddrW100->valuestring);
+                err = nvs_set_str(nvs_handle, "short_ad_relay", shortAddrRelay->valuestring);
+                if (err != ESP_OK) ESP_LOGE(TAG, "Failed to set short_ad_relay in NVS: %s", esp_err_to_name(err));
+                else ESP_LOGI(TAG, "Short Relay address set: %s", shortAddrRelay->valuestring);
+            }
+
+            err = nvs_commit(nvs_handle);
+            if (err != ESP_OK) ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
+            else ESP_LOGI(TAG, "NVS commit successful");
+
+            nvs_close(nvs_handle);
+
+            ESP_LOGI(TAG, "Config saved: Mode=%s, IEEE W100=%s, IEEE Relay=%s, Short W100=%s, Short Relay=%s",
+                     mode->valuestring, ieeeAddrW100->valuestring, ieeeAddrRelay->valuestring,
+                     shortAddrW100 ? shortAddrW100->valuestring : "N/A",
+                     shortAddrRelay ? shortAddrRelay->valuestring : "N/A");
+
+            httpd_resp_sendstr(req, "{\"status\":\"success\"}");
+
+            // Redémarrer uniquement si le mode a changé
+            if (strcmp(current_mode, mode->valuestring) != 0) {
+                ESP_LOGI(TAG, "Mode changed from %s to %s, restarting...", current_mode, mode->valuestring);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                esp_restart();
+            } else {
+                ESP_LOGI(TAG, "No mode change, no restart needed");
+            }
+        } else {
+            ESP_LOGE(TAG, "Failed to open NVS");
+            httpd_resp_sendstr(req, "{\"status\":\"error\"}");
+        }
+    } else {
+        ESP_LOGE(TAG, "Missing JSON fields");
+        httpd_resp_sendstr(req, "{\"status\":\"error\"}");
+    }
+
+    cJSON_Delete(json);
+    return ESP_OK;
+}
+
+static esp_err_t get_config_handler(httpd_req_t *req) {
+    ESP_LOGI(TAG, "Received request for /getConfig");
+
+    nvs_handle_t nvs_handle;
+    char mode[20] = {0};
+    char ieee_addr_w100[20] = {0};
+    char ieee_addr_relay[20] = {0};
+    char short_addr_w100[10] = {0};
+    char short_addr_relay[10] = {0};
+    size_t len;
+
+    esp_err_t err = nvs_open("storage", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS, error: %s", esp_err_to_name(err));
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    len = sizeof(mode);
+    err = nvs_get_str(nvs_handle, "mode", mode, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Mode not found in NVS, using default 'router'");
+        strcpy(mode, "router");
+    } else {
+        ESP_LOGI(TAG, "Loaded mode from NVS: %s (len=%zu)", mode, len);
+    }
+
+    len = sizeof(ieee_addr_w100);
+    err = nvs_get_str(nvs_handle, "ieee_addr_w100", ieee_addr_w100, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ieee_addr_w100 not found in NVS");
+        strcpy(ieee_addr_w100, "");
+    } else {
+        ESP_LOGI(TAG, "Loaded ieee_addr_w100 from NVS: %s (len=%zu)", ieee_addr_w100, len);
+    }
+
+    len = sizeof(ieee_addr_relay);
+    err = nvs_get_str(nvs_handle, "ieee_addr_relay", ieee_addr_relay, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ieee_addr_relay not found in NVS");
+        strcpy(ieee_addr_relay, "");
+    } else {
+        ESP_LOGI(TAG, "Loaded ieee_addr_relay from NVS: %s (len=%zu)", ieee_addr_relay, len);
+    }
+
+    len = sizeof(short_addr_w100);
+    err = nvs_get_str(nvs_handle, "short_ad_w100", short_addr_w100, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "short_ad_w100 not found in NVS");
+        strcpy(short_addr_w100, "");
+    } else {
+        ESP_LOGI(TAG, "Loaded short_ad_w100 from NVS: %s (len=%zu)", short_addr_w100, len);
+    }
+
+    len = sizeof(short_addr_relay);
+    err = nvs_get_str(nvs_handle, "short_ad_relay", short_addr_relay, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "short_ad_relay not found in NVS");
+        strcpy(short_addr_relay, "");
+    } else {
+        ESP_LOGI(TAG, "Loaded short_ad_relay from NVS: %s (len=%zu)", short_addr_relay, len);
+    }
+
+    nvs_close(nvs_handle);
+
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        ESP_LOGE(TAG, "Failed to create JSON object");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    cJSON_AddStringToObject(json, "mode", mode);
+    cJSON_AddStringToObject(json, "ieeeAddrW100", ieee_addr_w100);
+    cJSON_AddStringToObject(json, "ieeeAddrRelay", ieee_addr_relay);
+    cJSON_AddStringToObject(json, "shortAddrW100", short_addr_w100);
+    cJSON_AddStringToObject(json, "shortAddrRelay", short_addr_relay);
+
+    char *json_str = cJSON_Print(json);
+    if (json_str == NULL) {
+        ESP_LOGE(TAG, "Failed to print JSON");
+        cJSON_Delete(json);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Sending JSON response: %s", json_str);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json_str);
+    cJSON_free(json_str);
+    cJSON_Delete(json);
     return ESP_OK;
 }
 
@@ -1392,6 +1756,25 @@ static httpd_handle_t start_webserver(void)
             .handler   = pmtsd_handler,
             .user_ctx  = NULL
         };
+        httpd_uri_t parametres_uri = {
+            .uri = "/parametres",
+            .method = HTTP_GET,
+            .handler = parametres_handler,
+            .user_ctx = NULL
+        };
+        // Handler pour saveConfig
+        httpd_uri_t save_config_uri = {
+            .uri = "/saveConfig",
+            .method = HTTP_POST,
+            .handler = save_config_handler,
+            .user_ctx = NULL
+        };
+        httpd_uri_t get_config_uri = {
+            .uri = "/getConfig",
+            .method = HTTP_GET,
+            .handler = get_config_handler,
+            .user_ctx = NULL
+        };
         httpd_register_uri_handler(server, &get_uri);
         httpd_register_uri_handler(server, &favicon_uri);
         httpd_register_uri_handler(server, &post_uri);
@@ -1401,6 +1784,9 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &hvac_on);
         httpd_register_uri_handler(server, &hvac_off);
         httpd_register_uri_handler(server, &pmtsd);
+        httpd_register_uri_handler(server, &parametres_uri);
+        httpd_register_uri_handler(server, &save_config_uri);
+        httpd_register_uri_handler(server, &get_config_uri);
         ESP_LOGI(TAG, "Web server started on port %d", config.server_port);
     } else {
         ESP_LOGE(TAG, "Failed to start web server");
@@ -1411,7 +1797,29 @@ static httpd_handle_t start_webserver(void)
 static void esp_zb_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Free heap size at Zigbee task start: %lu bytes", esp_get_free_heap_size());
-    esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZR_CONFIG();
+    
+    // Configurer la structure Zigbee en fonction du mode
+    esp_zb_cfg_t zb_nwk_cfg;
+    if (strcmp(mode, "coordinator") == 0) {
+        ESP_LOGI(TAG, "Starting in Coordinator mode");
+        zb_nwk_cfg = (esp_zb_cfg_t){
+            .esp_zb_role = ESP_ZB_DEVICE_TYPE_COORDINATOR,
+            .install_code_policy = INSTALLCODE_POLICY_ENABLE,
+            .nwk_cfg.zczr_cfg = {
+                .max_children = 10,
+            },
+        };
+    } else { // Par défaut ou "router"
+        ESP_LOGI(TAG, "Starting in Router mode");
+        zb_nwk_cfg = (esp_zb_cfg_t){
+            .esp_zb_role = ESP_ZB_DEVICE_TYPE_ROUTER,
+            .install_code_policy = INSTALLCODE_POLICY_ENABLE,
+            .nwk_cfg.zczr_cfg = {
+                .max_children = 10,
+            },
+        };
+    }
+    
     esp_zb_init(&zb_nwk_cfg);
 
     // Cluster Basic (serveur)
@@ -1851,7 +2259,8 @@ static void update_server_attributes(void)
 
 static void send_hvac_on_command(void) {
     // Adresses MAC
-    uint8_t device_mac[] = THERMOSTAT_IEEE;
+    uint8_t device_mac[8]; // Définir une taille fixe de 8 octets pour une adresse IEEE
+    memcpy(device_mac, ieee_addr_w100_bytes, sizeof(device_mac));
     uint8_t hub_mac[] = HUB_IEEE;
 
     // Préfixe Zigbee
@@ -1919,7 +2328,7 @@ static void send_hvac_on_command(void) {
 
     esp_zb_zcl_write_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1, // Endpoint 1 du thermostat
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT, // Endpoint local
         },
@@ -1939,14 +2348,15 @@ static void send_hvac_on_command(void) {
     esp_zb_lock_release();
 
     last_tsn = tsn;
-    ESP_LOGI(TAG, "HVAC ON command sent to Aqara W100 (0x%04x, endpoint 1, cluster 0xFCC0), TSN: 0x%02x", THERMOSTAT, tsn);
+    ESP_LOGI(TAG, "HVAC ON command sent to Aqara W100 (0x%04x, endpoint 1, cluster 0xFCC0), TSN: 0x%02x", short_addr_w100_value, tsn);
 
 }
 
 static void send_hvac_off_command(void)
 {
     // Adresse MAC du thermostat
-    uint8_t device_mac[] = THERMOSTAT_IEEE;
+    uint8_t device_mac[8]; // Définir une taille fixe de 8 octets pour une adresse IEEE
+    memcpy(device_mac, ieee_addr_w100_bytes, sizeof(device_mac));
 
     // Préfixe Zigbee pour la commande OFF
     uint8_t prefix[] = {0xAA, 0x71, 0x1C, 0x44, 0x69, 0x1C};
@@ -2007,7 +2417,7 @@ static void send_hvac_off_command(void)
 
     esp_zb_zcl_write_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1, // Endpoint 1 du thermostat
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT // Endpoint local
         },
@@ -2025,7 +2435,7 @@ static void send_hvac_off_command(void)
     esp_zb_zcl_write_attr_cmd_req(&cmd);
     esp_zb_lock_release();
 
-    ESP_LOGI(TAG, "HVAC OFF command sent to Aqara W100 (0x%04x, endpoint 1, cluster 0xFCC0)", THERMOSTAT);
+    ESP_LOGI(TAG, "HVAC OFF command sent to Aqara W100 (0x%04x, endpoint 1, cluster 0xFCC0)", short_addr_w100_value);
 
     // Attendre une réponse ZCL
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -2112,7 +2522,7 @@ static void send_pmtsd_command(uint8_t power, uint8_t mode, float temp, uint8_t 
 
     esp_zb_zcl_write_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
@@ -2156,7 +2566,8 @@ static void set_sensor_mode(const char *mode) {
     uint32_t sec = (uint32_t)(us / 1000000);
     uint8_t timestamp[4] = { (sec >> 24) & 0xFF, (sec >> 16) & 0xFF, (sec >> 8) & 0xFF, sec & 0xFF };
 
-    uint8_t device_ieee[8] = THERMOSTAT_IEEE;
+    uint8_t device_ieee[8]; // Définir une taille fixe de 8 octets pour une adresse IEEE
+    memcpy(device_ieee, ieee_addr_w100_bytes, sizeof(device_ieee));
     uint8_t fictive_sensor[8] = {0x00, 0x15, 0x8D, 0x00, 0x01, 0x9D, 0x1B, 0x98};
     uint8_t chinese_humi[6] = {0xE6, 0xB9, 0xBF, 0xE5, 0xBA, 0xA6};
     uint8_t chinese_temp[6] = {0xE6, 0xB8, 0xA9, 0xE5, 0xBA, 0xA6};
@@ -2211,7 +2622,7 @@ static void set_sensor_mode(const char *mode) {
 
     esp_zb_zcl_write_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
@@ -2276,7 +2687,7 @@ static void set_sensor_mode(const char *mode) {
     /* Lire le mode pour confirmation */
     esp_zb_zcl_read_attr_cmd_t read_cmd = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
@@ -2339,7 +2750,7 @@ static void set_external_temperature(int16_t setpoint)
 
     esp_zb_zcl_write_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },
@@ -2400,7 +2811,7 @@ static void set_external_humidity(uint8_t battery_percent) {
 
     esp_zb_zcl_write_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
-            .dst_addr_u.addr_short = THERMOSTAT,
+            .dst_addr_u.addr_short = short_addr_w100_value,
             .dst_endpoint = 1,
             .src_endpoint = HA_ONOFF_SWITCH_ENDPOINT,
         },

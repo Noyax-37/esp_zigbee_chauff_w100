@@ -10,21 +10,32 @@
         label { display: inline-block; width: 200px; }
         input { padding: 5px; }
         .button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+        .disabled { opacity: 0.5; pointer-events: none; }
+        .hidden { display: none; }
     </style>
 </head>
 <body>
     <h1>Paramètres</h1>
     <form id="configForm">
         <div class="input-group">
-            <label for="ieeeAddr">Adresse IEEE du W100 (ex: 0x54ef441001263ef3):</label>
-            <input type="text" id="ieeeAddr" name="ieeeAddr" pattern="^0x[0-9a-fA-F]{16}$" required>
+            <label>Mode de fonctionnement :</label>
+            <label><input type="radio" name="mode" value="router" checked> Routeur</label>
+            <label><input type="radio" name="mode" value="coordinator"> Coordinateur</label>
         </div>
         <div class="input-group">
-            <label for="shortAddrW100">Adresse courte du W100:</label>
+            <label for="ieeeAddrW100">Adresse IEEE du W100 (ex: 0x0123456789abcdef):</label>
+            <input type="text" id="ieeeAddrW100" name="ieeeAddrW100" pattern="^0x[0-9a-fA-F]{16}$" required>
+        </div>
+        <div class="input-group long-adresses">
+            <label for="ieeeAddrRelay">Adresse IEEE du Relais (ex: 0xfedcba9876543210):</label>
+            <input type="text" id="ieeeAddrRelay" name="ieeeAddrRelay" pattern="^0x[0-9a-fA-F]{16}$" required>
+        </div>
+        <div class="input-group short-addresses">
+            <label for="shortAddrW100">Adresse courte du W100 (ex: 0x0a1b):</label>
             <input type="text" id="shortAddrW100" name="shortAddrW100" pattern="^0x[0-9a-fA-F]{4}$" required>
         </div>
-        <div class="input-group">
-            <label for="shortAddrRelay">Adresse courte du relais:</label>
+        <div class="input-group short-addresses">
+            <label for="shortAddrRelay">Adresse courte du Relais (ex: 0x2c3d):</label>
             <input type="text" id="shortAddrRelay" name="shortAddrRelay" pattern="^0x[0-9a-fA-F]{4}$" required>
         </div>
         <button type="button" class="button" onclick="saveConfig()">Sauvegarder</button>
@@ -32,30 +43,98 @@
     </form>
 
     <script>
+        // Charger les valeurs depuis NVS au démarrage
+        window.onload = function() {
+            fetch('/getConfig')
+                .then(response => {
+                    if (!response.ok) throw new Error('Failed to fetch config');
+                    return response.json();
+                })
+                .then(data => {
+                    console.log('Received config data:', data);
+                    if (data.mode) {
+                        document.querySelector(`input[name="mode"][value="${data.mode}"]`).checked = true;
+                    } else {
+                        document.querySelector('input[name="mode"][value="router"]').checked = true; // Default
+                    }
+                    if (data.ieeeAddrW100) document.getElementById('ieeeAddrW100').value = data.ieeeAddrW100;
+                    if (data.ieeeAddrRelay) document.getElementById('ieeeAddrRelay').value = data.ieeeAddrRelay;
+                    if (data.shortAddrW100) document.getElementById('shortAddrW100').value = data.shortAddrW100;
+                    if (data.shortAddrRelay) document.getElementById('shortAddrRelay').value = data.shortAddrRelay;
+
+                    // Mettre à jour l'affichage en fonction du mode
+                    updateFieldVisibility();
+                })
+                .catch(error => console.error('Error loading config:', error));
+
+            // Écouter les changements de mode
+            document.querySelectorAll('input[name="mode"]').forEach(radio => {
+                radio.addEventListener('change', updateFieldVisibility);
+            });
+        };
+
+        function updateFieldVisibility() {
+            const isRouter = document.querySelector('input[name="mode"]:checked').value === 'router';
+            const shortAddressGroups = document.querySelectorAll('.short-addresses');
+            const longAddressGroups = document.querySelectorAll('.long-adresses');
+            shortAddressGroups.forEach(group => {
+                group.classList.toggle('hidden', !isRouter);
+                const inputs = group.querySelectorAll('input');
+                inputs.forEach(input => {
+                    input.disabled = !isRouter;
+                    input.classList.toggle('disabled', !isRouter);
+                });
+            });
+            longAddressGroups.forEach(group => {
+                group.classList.toggle('hidden', isRouter);
+                const inputs = group.querySelectorAll('input');
+                inputs.forEach(input => {
+                    input.disabled = isRouter;
+                    input.classList.toggle('disabled', isRouter);
+                });
+            });
+        }
+
         function saveConfig() {
-            const ieeeAddr = document.getElementById('ieeeAddr').value;
+            const mode = document.querySelector('input[name="mode"]:checked').value;
+            const ieeeAddrW100 = document.getElementById('ieeeAddrW100').value;
+            const ieeeAddrRelay = document.getElementById('ieeeAddrRelay').value;
             const shortAddrW100 = document.getElementById('shortAddrW100').value;
             const shortAddrRelay = document.getElementById('shortAddrRelay').value;
 
-            // Validation des entrées (déjà partiellement gérée par pattern)
-            if (!ieeeAddr.match(/^0x[0-9a-fA-F]{16}$/) || !shortAddrW100.match(/^0x[0-9a-fA-F]{4}$/) || !shortAddrRelay.match(/^0x[0-9a-fA-F]{4}$/)) {
-                alert("Veuillez entrer des adresses valides.");
+            if (!ieeeAddrW100.match(/^0x[0-9a-fA-F]{16}$/)) {
+                alert("Veuillez entrer une adresse IEEE valide pour le W100.");
+                return;
+            }
+            if (mode === 'router' && (!shortAddrW100.match(/^0x[0-9a-fA-F]{4}$/) || !shortAddrRelay.match(/^0x[0-9a-fA-F]{4}$/))) {
+                alert("Veuillez entrer des adresses courtes valides pour le mode Routeur.");
+                return;
+            } else if (mode === 'coordinator' && !ieeeAddrRelay.match(/^0x[0-9a-fA-F]{16}$/)) {
+                alert("Veuillez entrer une adresse IEEE valide pour le Relais.");
                 return;
             }
 
-            // Envoi des données au serveur pour sauvegarde en NVS
             fetch('/saveConfig', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ieeeAddr, shortAddrW100, shortAddrRelay })
-            }).then(response => {
+                body: JSON.stringify({ mode, ieeeAddrW100, ieeeAddrRelay, shortAddrW100, shortAddrRelay })
+            })
+            .then(response => {
                 if (response.ok) {
-                    alert("Paramètres sauvegardés. Redémarrage en cours...");
-                    // Le serveur gérera le reboot
+                    document.getElementById('configForm').innerHTML = '<p>Configuration sauvegardée, retour sur la page principale dans 30 secondes...</p>';
+                    setTimeout(() => {
+                        window.location.href = '/';
+                    }, 30000);
                 } else {
-                    alert("Erreur lors de la sauvegarde.");
+                    throw new Error('Erreur lors de la sauvegarde');
                 }
-            }).catch(error => alert("Erreur : " + error));
+            })
+            .catch(error => {
+                document.getElementById('configForm').innerHTML = '<p>Configuration sauvegardée (redémarrage en cours), retour automatique dans 30 secondes...</p>';
+                setTimeout(() => {
+                    window.location.href = '/';
+                }, 30000);
+            });
         }
 
         function cancelConfig() {
