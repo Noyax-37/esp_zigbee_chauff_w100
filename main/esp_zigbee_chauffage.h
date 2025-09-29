@@ -10,6 +10,11 @@
 #include <string.h>
 #include <ctype.h>
 
+// configuration LED onboard
+#define LED_GPIO 8
+#define LEDC_CHANNEL LEDC_CHANNEL_0
+#define LEDC_TIMER LEDC_TIMER_0
+
 // Configuration Wi-Fi
 #define WIFI_SSID "Bbox-417260CF-Legacy"
 #define WIFI_PASSWORD "KqphCaz6QgxZc697GS"
@@ -29,9 +34,10 @@
 #define RELAY_BINDING_EP                1
 #define DEFAULT_OCCUPIED_HEATING_SETPOINT 2100
 // gardé pour mémoire:
-// #define RELAY_CHAUFF                    0xB377
-// #define THERMOSTAT                      0xC0E4
-// #define THERMOSTAT_IEEE                 {0x54, 0xEF, 0x44, 0x10, 0x01, 0x26, 0x3E, 0xF3}
+//#define RELAY_CHAUFF                    0xB377
+//#define THERMOSTAT                      0xC0E4
+//#define RELAY_CHAUFF_IEEE               0x7c2c67fffe75c28c
+//#define THERMOSTAT_IEEE                 0x54ef441001263ef3
 #define HUB_IEEE                        {0x54, 0xEF, 0x44, 0x80, 0x71, 0x1A}
 #define HYSTERESIS_MOINS                10
 #define HYSTERESIS_PLUS                 10

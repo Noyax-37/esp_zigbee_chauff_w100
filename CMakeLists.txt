@@ -5,4 +5,4 @@ set(EXTRA_COMPONENT_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/switch_driver
     )
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(Zigbee_customized_thermostat)
+project(thermostat_zigbee_w100)

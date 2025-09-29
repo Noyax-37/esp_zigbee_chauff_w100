@@ -33,6 +33,8 @@ Téléversez le système de fichiers SPIFFS contenant index.html avec idf.py -p 
 
 Fonctionnement
 
+Au premier boot ou après un erase flash complet, l'esp démarre une première fois sans wifi pour initialiser le zigbee puis une fois initialisé reboot. Plusieurs redémarrages peuvent être nécessaires pour le premier appairage, ne pas hésiter à positionner l'esp32-c6 au plus proche du coordinateur pendant l'appairage.
+
 Une fois démarré, l'ESP32 se connecte au réseau Wi-Fi et rejoint le réseau Zigbee.
 Une interface web est accessible à l'adresse IP statique (par défaut : 192.168.1.160).
 Fonctionnalités :
