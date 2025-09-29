@@ -81,7 +81,7 @@ static void write_thermostat_attributes(int16_t new_setpoint, uint16_t new_high_
                                        bool setpoint_updated, bool hysteresis_high_updated, bool hysteresis_low_updated);
 static void set_sensor_mode(const char *mode_ext_int);
 static void set_external_temperature(int16_t setpoint);
-static void set_external_humidity(uint8_t humidity_percent);
+static void set_external_humidity(uint16_t humidity_percent);
 static void save_settings_to_nvs(void);
 static void load_settings_from_nvs(void);
 static void send_on_off_command(uint8_t command_id);
@@ -230,9 +230,12 @@ static void load_settings_from_nvs(void) {
     size_t len = sizeof(ieee_addr_w100);
     err = nvs_get_str(nvs_handle, "ieee_addr_w100", ieee_addr_w100, &len);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read ieee_addr_w100: %s, using empty string", esp_err_to_name(err));
-        strcpy(ieee_addr_w100, "");
-        memset(ieee_addr_w100_bytes, 0, sizeof(ieee_addr_w100_bytes));
+        ESP_LOGW(TAG, "Failed to read ieee_addr_w100: %s, using default", esp_err_to_name(err));
+        strcpy(ieee_addr_w100, "0x54ef441001263ef3");
+        if (convert_ieee_address(ieee_addr_w100, ieee_addr_w100_bytes) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert ieee_addr_w100");
+            memset(ieee_addr_w100_bytes, 0, sizeof(ieee_addr_w100_bytes));
+        }
     } else {
         ESP_LOGI(TAG, "Loaded ieee_addr_w100 from NVS: %s (len=%zu)", ieee_addr_w100, len);
         if (convert_ieee_address(ieee_addr_w100, ieee_addr_w100_bytes) != ESP_OK) {
@@ -244,9 +247,12 @@ static void load_settings_from_nvs(void) {
     len = sizeof(ieee_addr_relay);
     err = nvs_get_str(nvs_handle, "ieee_addr_relay", ieee_addr_relay, &len);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read ieee_addr_relay: %s, using empty string", esp_err_to_name(err));
-        strcpy(ieee_addr_relay, "");
-        memset(ieee_addr_relay_bytes, 0, sizeof(ieee_addr_relay_bytes));
+        ESP_LOGW(TAG, "Failed to read ieee_addr_relay: %s, using default", esp_err_to_name(err));
+        strcpy(ieee_addr_relay, "0x7c2c67fffe75c28c");
+        if (convert_ieee_address(ieee_addr_relay, ieee_addr_relay_bytes) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert ieee_addr_relay");
+            memset(ieee_addr_relay_bytes, 0, sizeof(ieee_addr_relay_bytes));
+        }
     } else {
         ESP_LOGI(TAG, "Loaded ieee_addr_relay from NVS: %s (len=%zu)", ieee_addr_relay, len);
         if (convert_ieee_address(ieee_addr_relay, ieee_addr_relay_bytes) != ESP_OK) {
@@ -258,9 +264,12 @@ static void load_settings_from_nvs(void) {
     len = sizeof(short_addr_w100);
     err = nvs_get_str(nvs_handle, "short_ad_w100", short_addr_w100, &len);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read short_ad_w100: %s, using empty string", esp_err_to_name(err));
-        strcpy(short_addr_w100, "");
-        short_addr_w100_value = 0;
+        ESP_LOGW(TAG, "Failed to read short_ad_w100: %s, using default", esp_err_to_name(err));
+        strcpy(short_addr_w100, "0xC0E4");
+        if (convert_short_address(short_addr_w100, &short_addr_w100_value) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert short_addr_w100");
+            short_addr_w100_value = 0;
+        }
     } else {
         ESP_LOGI(TAG, "Loaded short_ad_w100 from NVS: %s (len=%zu)", short_addr_w100, len);
         if (convert_short_address(short_addr_w100, &short_addr_w100_value) != ESP_OK) {
@@ -272,9 +281,12 @@ static void load_settings_from_nvs(void) {
     len = sizeof(short_addr_relay);
     err = nvs_get_str(nvs_handle, "short_ad_relay", short_addr_relay, &len);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read short_ad_relay: %s, using empty string", esp_err_to_name(err));
-        strcpy(short_addr_relay, "");
-        short_addr_relay_value = 0;
+        ESP_LOGW(TAG, "Failed to read short_ad_relay: %s, using default", esp_err_to_name(err));
+        strcpy(short_addr_relay, "0xB377");
+        if (convert_short_address(short_addr_relay, &short_addr_relay_value) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert short_addr_relay");
+            short_addr_relay_value = 0;
+        }
     } else {
         ESP_LOGI(TAG, "Loaded short_ad_relay from NVS: %s (len=%zu)", short_addr_relay, len);
         if (convert_short_address(short_addr_relay, &short_addr_relay_value) != ESP_OK) {
@@ -335,7 +347,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             // Mettre la temp ext au setpoint
             set_external_temperature(last_heating_setpoint);
             // Mettre l'humidité ext à 0 (provisoire)
-            set_external_humidity(0);
+            set_external_humidity(relay_actual_state == 1 ? 9900 : 0); // 99% si le relais est ON, sinon 0%
             zigbee_network_initialized = true;
 
             xTaskCreate(update_attributes_task, "Update_Attributes", 2048, NULL, 1, NULL);
@@ -444,7 +456,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 
 static void send_on_off_command(uint8_t command_id)
 {
-    if (command_id == last_command_sent) {
+    if ((command_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID && relay_actual_state == 1) || (command_id == ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID && relay_actual_state == 0)) {
         ESP_LOGI(TAG, "Skipping %s command to Shelly relay (0x%04x, endpoint %d): already in this state",
                  (command_id == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", short_addr_relay_value, RELAY_BINDING_EP);
         return;
@@ -844,10 +856,17 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
 
     if (message->src_address.u.short_addr == short_addr_relay_value && message->cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
         if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
+            uint8_t relay_historical_state = relay_actual_state;
             relay_actual_state = (*(uint8_t *)message->attribute.data.value != 0) ? 1 : 0;
             ESP_LOGI(TAG, "Relay 0x%04x On/Off state: %s", 
                      message->src_address.u.short_addr, 
                      (relay_actual_state == 1) ? "ON" : "OFF");
+            if (relay_historical_state != relay_actual_state) {
+                ESP_LOGI(TAG, "Relay state changed from %s to %s",
+                         (relay_historical_state == 1) ? "ON" : "OFF",
+                         (relay_actual_state == 1) ? "ON" : "OFF");
+                set_external_humidity(relay_actual_state == 1 ? 9900 : 0); // 99% si le relais est ON, sinon 0%
+            }
             if (zigbee_network_initialized) {
                 update_server_attributes();
             }
@@ -977,6 +996,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
             ESP_LOGI(TAG, "Command %s (0x%02x) to Relay (0x%04x) %s",
                     (resp->resp_to_cmd == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", resp->resp_to_cmd,
                     short_addr_relay_value, (resp->status_code == 0) ? "succeeded" : "failed");
+            // set_external_humidity((resp->resp_to_cmd == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? 9900 : 0); // 99% si le relais est ON, sinon 0%
         }
         break;
     }
@@ -1063,7 +1083,7 @@ static esp_err_t example_set_dns_server(esp_netif_t *netif, uint32_t addr, esp_n
     return ESP_OK;
 }
 
-static void example_set_static_ip(esp_netif_t *netif)
+static void wifi_set_static_ip(esp_netif_t *netif)
 {
     if (esp_netif_dhcpc_stop(netif) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to stop dhcp client");
@@ -1091,7 +1111,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
-        example_set_static_ip(netif);
+        wifi_set_static_ip(netif);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGW(TAG, "Disconnected from Wi-Fi, retrying... (Attempt %d/%d)", s_retry_num + 1, WIFI_MAX_RETRIES);
@@ -1181,21 +1201,21 @@ static esp_err_t get_handler(httpd_req_t *req)
     long file_size = ftell(f);
     rewind(f);
     ESP_LOGI(TAG, "Index.html size: %ld bytes", file_size);
-    if (file_size > 30000) {
-        ESP_LOGE(TAG, "Index.html too large (%" PRId32 " bytes), max is 30000 bytes", (int32_t)file_size);
+    if (file_size > 40000) {
+        ESP_LOGE(TAG, "Index.html too large (%" PRId32 " bytes), max is 40000 bytes", (int32_t)file_size);
         fclose(f);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
-    char *response = (char *)calloc(30000, 1);
+    char *response = (char *)calloc(40000, 1);
     if (response == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for response");
         fclose(f);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
-    char *updated_response = (char *)calloc(30000, 1);
+    char *updated_response = (char *)calloc(40000, 1);
     if (updated_response == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for updated_response");
         free(response);
@@ -1204,7 +1224,7 @@ static esp_err_t get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    size_t len = fread(response, 1, 30000, f);
+    size_t len = fread(response, 1, 40000, f);
     fclose(f);
     ESP_LOGI(TAG, "Read %u bytes from index.html", len);
 
@@ -1225,10 +1245,10 @@ static esp_err_t get_handler(httpd_req_t *req)
     snprintf(setpoint_str, sizeof(setpoint_str), "%.1f", last_heating_setpoint != INT16_MIN ? last_heating_setpoint / 100.0 : 0.0);
     snprintf(relay_str, sizeof(relay_str), "%s", last_command_sent == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID ? "ON" : "OFF");
 
-    int res_len = snprintf(updated_response, 30000,
+    int res_len = snprintf(updated_response, 40000,
                            response,
                            temp_str, humi_str, setpoint_str, relay_str, running_state_str, setpoint_str);
-    if (res_len >= 30000) {
+    if (res_len >= 40000) {
         ESP_LOGE(TAG, "Buffer overflow in get_handler, response truncated, res_len=%d", res_len);
         free(response);
         free(updated_response);
@@ -1999,6 +2019,7 @@ static void esp_zb_task(void *pvParameters)
         ESP_LOGE(TAG, "Failed to create Multistate Input client cluster list");
         return;
     }
+
     esp_zb_attribute_list_t *esp_zb_ota_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_OTA_UPGRADE);
     if (esp_zb_ota_cluster == NULL) {
         ESP_LOGE(TAG, "Failed to create OTA cluster list");
@@ -2175,14 +2196,6 @@ static void esp_zb_task(void *pvParameters)
         ESP_LOGE(TAG, "Failed to create Multistate Input server cluster list");
         return;
     }
-    bool out_of_service = ESP_ZB_ZCL_MULTI_INPUT_OUT_OF_SERVICE_DEFAULT_VALUE; // false
-    status = esp_zb_multistate_input_cluster_add_attr(esp_zb_multistate_input_server_cluster, 
-                                                     ESP_ZB_ZCL_ATTR_MULTI_INPUT_OUT_OF_SERVICE_ID, 
-                                                     &out_of_service);
-    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
-        ESP_LOGE(TAG, "Failed to add Multistate Input OutOfService attribute: status 0x%02x", status);
-        return;
-    }
     uint16_t present_value = ESP_ZB_ZCL_MULTI_INPUT_PRESENT_VALUE_DEFAULT_VALUE; // 0
     status = esp_zb_multistate_input_cluster_add_attr(esp_zb_multistate_input_server_cluster, 
                                                      ESP_ZB_ZCL_ATTR_MULTI_INPUT_PRESENT_VALUE_ID, 
@@ -2207,6 +2220,14 @@ static void esp_zb_task(void *pvParameters)
         ESP_LOGE(TAG, "Failed to add Multistate Input NumberOfStates attribute: status 0x%02x", status);
         return;
     }    
+    bool out_of_service = false;
+    status = esp_zb_multistate_input_cluster_add_attr(esp_zb_multistate_input_server_cluster, 
+                                                     ESP_ZB_ZCL_ATTR_MULTI_INPUT_OUT_OF_SERVICE_ID, 
+                                                     &out_of_service);
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGE(TAG, "Failed to add Multistate Input OutOfService attribute: status 0x%02x", status);
+        return;
+    }
 
     // Liste des clusters
     esp_zb_cluster_list_t *esp_zb_cluster_list = esp_zb_zcl_cluster_list_create();
@@ -2923,8 +2944,8 @@ static void set_external_temperature(int16_t setpoint)
     ESP_LOGI(TAG, "External temperature (setpoint) défini sur %d.%d °C, TSN unknown", setpoint / 100, abs(setpoint % 100));
 }
 
-/* Fonction pour définir external_humidity (% batterie, à implémenter plus tard) */
-static void set_external_humidity(uint8_t battery_percent) {
+/* Fonction pour définir external_humidity (% batterie, à implémenter plus tard) mais actuellement utilisée pour afficher 100% si chauffage actif */
+static void set_external_humidity(uint16_t battery_percent) {
     uint8_t fictive_sensor[8] = {0x00, 0x15, 0x8D, 0x00, 0x01, 0x9D, 0x1B, 0x98};
 
     float f = (float)battery_percent;
@@ -3025,5 +3046,6 @@ void app_main(void)
     load_settings_from_nvs(); // Charger les paramètres au démarrage
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
     wifi_init();
+    // xTaskCreate(esp_zb_task, "Zigbee_main", 4096 * 4, NULL, 2, &zb_task_handle);
     xTaskCreate(watchdog_task, "watchdog_task", 2048, NULL, 1, NULL);
 }

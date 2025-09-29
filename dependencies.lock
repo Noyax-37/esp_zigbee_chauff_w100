@@ -10,7 +10,7 @@ dependencies:
       type: service
     version: 1.6.4
   espressif/esp-zigbee-lib:
-    component_hash: 76fad74d3720df73383d7fa7469b62c3261e853ee24c59933dc6d74e707f277e
+    component_hash: 4b73d7dc7d018114f24712a5af1bb7a53dca95f979fe646461f066f344dd9120
     dependencies:
     - name: idf
       require: private
@@ -18,7 +18,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.6.6
+    version: 1.6.7
   idf:
     source:
       type: idf

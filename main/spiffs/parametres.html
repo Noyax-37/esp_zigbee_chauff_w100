@@ -121,19 +121,19 @@
             })
             .then(response => {
                 if (response.ok) {
-                    document.getElementById('configForm').innerHTML = '<p>Configuration sauvegardée, retour sur la page principale dans 30 secondes...</p>';
+                    document.getElementById('configForm').innerHTML = '<p>Configuration sauvegardée, retour sur la page principale dans 5 secondes...</p>';
                     setTimeout(() => {
                         window.location.href = '/';
-                    }, 30000);
+                    }, 5000);
                 } else {
                     throw new Error('Erreur lors de la sauvegarde');
                 }
             })
             .catch(error => {
-                document.getElementById('configForm').innerHTML = '<p>Configuration sauvegardée (redémarrage en cours), retour automatique dans 30 secondes...</p>';
+                document.getElementById('configForm').innerHTML = '<p>Configuration sauvegardée (redémarrage en cours), retour automatique dans 5 secondes...</p>';
                 setTimeout(() => {
                     window.location.href = '/';
-                }, 30000);
+                }, 5000);
             });
         }
 

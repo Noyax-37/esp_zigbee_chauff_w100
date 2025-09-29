@@ -16,5 +16,8 @@
   "files.associations": {
     "esp_zigbee_core.h": "c",
     "esp_system.h": "c"
-  }
+  },
+  "idf.espIdfPathWin": "C:\\Users\\alain\\esp\\v5.4.2\\esp-idf",
+  "idf.toolsPathWin": "C:\\Users\\alain\\.espressif",
+  "idf.pythonInstallPath": "C:\\Users\\alain\\.espressif\\tools\\idf-python\\3.11.2\\python.exe"
 }
