@@ -440,9 +440,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      report->clusterID, report->attributeID);
             /* Les valeurs d'attributs doivent être parsées séparément via esp_zb_zcl_attribute_t */
             /* Exemple : utiliser ZB_ZCL_GET_ATTRIBUTE_VALUE si disponible */
-        } else {
-            ESP_LOGI(TAG, "Unknown signal: %s (0x%x), status: %s (0x%x), payload ptr: %p, signal_struct ptr: %p", 
-                     esp_zb_zdo_signal_to_string(sig_type), sig_type, esp_err_to_name(err_status), err_status, signal_struct->p_app_signal, signal_struct);
         }
         break;
     }
@@ -954,9 +951,6 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     case ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID:
     {
         esp_zb_zcl_cmd_default_resp_message_t *resp = (esp_zb_zcl_cmd_default_resp_message_t *)message;
-        ESP_LOGI(TAG, "Received ZCL Default Response from address(0x%04x) endpoint(%d) cluster(0x%04x) command(0x%02x) status(0x%02x)",
-                resp->info.src_address.u.short_addr, resp->info.src_endpoint, resp->info.cluster, 
-                resp->resp_to_cmd, resp->status_code);
         if (resp->info.src_address.u.short_addr == short_addr_w100_value && resp->info.cluster == 0xFCC0) {
             if (resp->status_code == 0) {
                 ESP_LOGI(TAG, "Write command to thermostat (0x%04x) succeeded", short_addr_w100_value);
@@ -1018,7 +1012,7 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
                         uint8_t *data = (uint8_t *)variable->attribute.data.value;
                         uint16_t data_len = variable->attribute.data.size;
                         ESP_LOGI(TAG, "Reception sur attribut 0xFFF2, length: %d", data_len);
-                        ESP_LOG_BUFFER_HEX(TAG, data, data_len);
+                        //ESP_LOG_BUFFER_HEX(TAG, data, data_len);
                         // Vérifier si c'est une requête PMTSD
                         if (data_len >= 4 && data[data_len - 4] == 0x08 && data[data_len - 3] == 0x00 &&
                             data[data_len - 2] == 0x08 && data[data_len - 1] == 0x44) {
@@ -1118,7 +1112,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             ESP_LOGW(TAG, "Max Wi-Fi retries reached (%d), starting Zigbee fallback.", WIFI_MAX_RETRIES);
             wifi_failed = true;
             if (zb_task_handle == NULL) {
-                xTaskCreate(esp_zb_task, "Zigbee_main", 4096 * 4, NULL, 2, &zb_task_handle);
+                xTaskCreate(esp_zb_task, "Zigbee_main", 8192 * 4, NULL, 2, &zb_task_handle);
             }
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -1127,7 +1121,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         s_retry_num = 0;
         ESP_LOGI(TAG, "Free heap size after IP: %lu bytes", esp_get_free_heap_size());
         if (zb_task_handle == NULL) {
-            xTaskCreate(esp_zb_task, "Zigbee_main", 4096 * 4, NULL, 2, &zb_task_handle);
+            xTaskCreate(esp_zb_task, "Zigbee_main", 8192 * 4, NULL, 2, &zb_task_handle);
         }
         httpd_handle_t server = start_webserver();
         if (server == NULL) {
@@ -2361,7 +2355,9 @@ static void update_server_attributes(void)
 
     // mettre à jour l'attribut heating setpoint du cluster Thermostat serveur
     int16_t heat_setpoint = (last_heating_setpoint != INT16_MIN && last_heating_setpoint >= 500) ? last_heating_setpoint : ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_DEFAULT_VALUE;
-    ESP_LOGI(TAG, "thermostat last heating setpoint = %d and heat setpoint = %d", last_heating_setpoint, heat_setpoint); // Log pour débogage
+    if (last_heating_setpoint != heat_setpoint) {
+        ESP_LOGI(TAG, "thermostat last heating setpoint = %d and heat setpoint = %d", last_heating_setpoint, heat_setpoint); // Log pour débogage
+    }
     status = esp_zb_zcl_set_attribute_val(
         HA_ONOFF_SWITCH_ENDPOINT,
         ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
@@ -2378,7 +2374,9 @@ static void update_server_attributes(void)
     if (((last_cooling_setpoint >= last_heating_setpoint) ? last_cooling_setpoint : ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_DEFAULT_VALUE) > 
                 ((last_heating_setpoint != INT16_MIN && last_heating_setpoint >= 500) ? last_heating_setpoint : ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_HEATING_SETPOINT_DEFAULT_VALUE)) {
         int16_t cool_setpoint = (last_cooling_setpoint >= last_heating_setpoint) ? last_cooling_setpoint : ESP_ZB_ZCL_THERMOSTAT_OCCUPIED_COOLING_SETPOINT_DEFAULT_VALUE;
-        ESP_LOGI(TAG, "thermostat last cooling setpoint = %d and cool setpoint = %d", last_cooling_setpoint, cool_setpoint); // Log pour débogage
+        if (last_cooling_setpoint != cool_setpoint) {
+            ESP_LOGI(TAG, "thermostat last cooling setpoint = %d and cool setpoint = %d", last_cooling_setpoint, cool_setpoint); // Log pour débogage
+        }
         status = esp_zb_zcl_set_attribute_val(
             HA_ONOFF_SWITCH_ENDPOINT,
             ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
@@ -3072,7 +3070,7 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "Failed to load settings from NVS, presume first boot, connect zigbee then reboot");
         first_boot = true;
-        xTaskCreate(esp_zb_task, "Zigbee_main", 4096 * 4, NULL, 2, &zb_task_handle);
+        xTaskCreate(esp_zb_task, "Zigbee_main", 8192 * 4, NULL, 2, &zb_task_handle);
     }
     xTaskCreate(watchdog_task, "watchdog_task", 2048, NULL, 1, NULL);
 }

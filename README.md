@@ -4,8 +4,10 @@ Ce projet implémente un contrôleur de thermostat basé sur une puce ESP32, uti
 Prérequis
 
 Matériel : Une carte ESP32 compatible avec le firmware ESP-ZB.
-Logiciel : Environnement de développement ESP-IDF installé.
-Réseau Zigbee : Un coordinateur Zigbee (par exemple, un dongle Zigbee connecté à un Raspberry Pi avec Zigbee2MQTT).
+Logiciel :  Codage sous VS code
+            Environnement de développement ESP-IDF installé, version 5.4.2 (la version 5.5.1 créé des reboots intempestifs chez moi). 
+            SDK Zigbee version 1.6.6
+Réseau Zigbee : Un coordinateur Zigbee. L'esp32 peut servir de routeur (voir les paramètres) mais non testé.
 
 Configuration Initiale
 
@@ -33,14 +35,16 @@ Téléversez le système de fichiers SPIFFS contenant index.html avec idf.py -p 
 
 Fonctionnement
 
-Au premier boot ou après un erase flash complet, l'esp démarre une première fois sans wifi pour initialiser le zigbee puis une fois initialisé reboot. Plusieurs redémarrages peuvent être nécessaires pour le premier appairage, ne pas hésiter à positionner l'esp32-c6 au plus proche du coordinateur pendant l'appairage.
+Au premier boot ou après un erase flash complet, l'esp démarre une première fois sans wifi pour initialiser le zigbee puis une fois initialisé reboot. Plusieurs redémarrages manuels peuvent être nécessaires pour le premier appairage, ne pas hésiter à positionner l'esp32-c6 au plus proche du coordinateur pendant l'appairage.
 
 Une fois démarré, l'ESP32 se connecte au réseau Wi-Fi et rejoint le réseau Zigbee.
 Une interface web est accessible à l'adresse IP statique (par défaut : 192.168.1.160).
 Fonctionnalités :
 Affichage en temps réel de la température, du setpoint, et de l'état du relais.
 Mise à jour du setpoint via l'interface web (bouton "Update Setpoint").
+En cours de développement : mise au point du setpoint via les boutons "+" et "-" (non fonctionnel actuellement).
 Contrôle automatique du relais basé sur la température et le setpoint (avec hystérésis par défaut à 0.1°C si non configuré).
+Possibilité de "jouer" avec la ligne du milieu du W100 mais pas encore exploité par le partie thermostat car la température ne peut pas être réglée au 10ème de degré celsius.
 
 
 Les données sont mises à jour toutes les 5 secondes via des requêtes AJAX.
