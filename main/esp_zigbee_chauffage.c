@@ -33,7 +33,7 @@
 #include "zboss_api_buf.h"
 #include "esp_mac.h"
 #include "esp_zigbee_core.h"
-#include "driver/ledc.h"
+#include "driver/gpio.h"
 
 static const char *TAG = "ESP_ZIGBEE_CHAUFFAGE";
 
@@ -53,7 +53,6 @@ static uint8_t last_command_sent = 0xFF;
 static uint8_t tsn_counter = 0;
 static int s_retry_num = 0;
 static bool wifi_failed = false;
-static bool first_boot = false;
 static TaskHandle_t zb_task_handle = NULL;
 static bool first_request = true;
 static bool zigbee_network_initialized = false;
@@ -85,7 +84,7 @@ static void set_sensor_mode(const char *mode_ext_int);
 static void set_external_temperature(int16_t setpoint);
 static void set_external_humidity(uint16_t humidity_percent);
 static void save_settings_to_nvs(void);
-static esp_err_t load_settings_from_nvs(void);
+static void load_settings_from_nvs(void);
 static void send_on_off_command(uint8_t command_id);
 static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_message_t *message);
 static esp_err_t post_handler(httpd_req_t *req);
@@ -193,7 +192,7 @@ static void save_settings_to_nvs(void) {
              last_heating_setpoint, input_high_hyst, input_low_hyst);
 }
 
-static esp_err_t load_settings_from_nvs(void) {
+static void load_settings_from_nvs(void) {
     nvs_handle_t nvs_handle;
     esp_err_t err;
 
@@ -203,12 +202,12 @@ static esp_err_t load_settings_from_nvs(void) {
         last_heating_setpoint = HEATING_SETPOINT_DEFAULT;
         input_high_hyst = HIGH_HYST_DEFAULT;
         input_low_hyst = LOW_HYST_DEFAULT;
-        short_addr_w100_value = 0;
-        short_addr_relay_value = 0;
-        memset(ieee_addr_w100_bytes, 0, sizeof(ieee_addr_w100_bytes));
-        memset(ieee_addr_relay_bytes, 0, sizeof(ieee_addr_relay_bytes));
+        strcpy(ieee_addr_w100, "");
+        strcpy(ieee_addr_relay, "");
+        strcpy(short_addr_w100, "");
+        strcpy(short_addr_relay, "");
         strcpy(mode_rout_coord, "router"); // Default mode
-        return ESP_FAIL;
+        return;
     }
 
     err = nvs_get_i16(nvs_handle, "setpoint", &last_heating_setpoint);
@@ -233,7 +232,11 @@ static esp_err_t load_settings_from_nvs(void) {
     err = nvs_get_str(nvs_handle, "ieee_addr_w100", ieee_addr_w100, &len);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to read ieee_addr_w100: %s, using default", esp_err_to_name(err));
-        memset(ieee_addr_w100_bytes, 0, sizeof(ieee_addr_w100_bytes));
+        strcpy(ieee_addr_w100, "0x54ef441001263ef3");
+        if (convert_ieee_address(ieee_addr_w100, ieee_addr_w100_bytes) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert ieee_addr_w100");
+            memset(ieee_addr_w100_bytes, 0, sizeof(ieee_addr_w100_bytes));
+        }
     } else {
         ESP_LOGI(TAG, "Loaded ieee_addr_w100 from NVS: %s (len=%zu)", ieee_addr_w100, len);
         if (convert_ieee_address(ieee_addr_w100, ieee_addr_w100_bytes) != ESP_OK) {
@@ -246,7 +249,11 @@ static esp_err_t load_settings_from_nvs(void) {
     err = nvs_get_str(nvs_handle, "ieee_addr_relay", ieee_addr_relay, &len);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to read ieee_addr_relay: %s, using default", esp_err_to_name(err));
-        memset(ieee_addr_relay_bytes, 0, sizeof(ieee_addr_relay_bytes));
+        strcpy(ieee_addr_relay, "0x7c2c67fffe75c28c");
+        if (convert_ieee_address(ieee_addr_relay, ieee_addr_relay_bytes) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert ieee_addr_relay");
+            memset(ieee_addr_relay_bytes, 0, sizeof(ieee_addr_relay_bytes));
+        }
     } else {
         ESP_LOGI(TAG, "Loaded ieee_addr_relay from NVS: %s (len=%zu)", ieee_addr_relay, len);
         if (convert_ieee_address(ieee_addr_relay, ieee_addr_relay_bytes) != ESP_OK) {
@@ -259,7 +266,11 @@ static esp_err_t load_settings_from_nvs(void) {
     err = nvs_get_str(nvs_handle, "short_ad_w100", short_addr_w100, &len);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to read short_ad_w100: %s, using default", esp_err_to_name(err));
-        short_addr_w100_value = 0;
+        strcpy(short_addr_w100, "0xC0E4");
+        if (convert_short_address(short_addr_w100, &short_addr_w100_value) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert short_addr_w100");
+            short_addr_w100_value = 0;
+        }
     } else {
         ESP_LOGI(TAG, "Loaded short_ad_w100 from NVS: %s (len=%zu)", short_addr_w100, len);
         if (convert_short_address(short_addr_w100, &short_addr_w100_value) != ESP_OK) {
@@ -272,7 +283,11 @@ static esp_err_t load_settings_from_nvs(void) {
     err = nvs_get_str(nvs_handle, "short_ad_relay", short_addr_relay, &len);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to read short_ad_relay: %s, using default", esp_err_to_name(err));
-        short_addr_relay_value = 0;
+        strcpy(short_addr_relay, "0xB377");
+        if (convert_short_address(short_addr_relay, &short_addr_relay_value) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to convert short_addr_relay");
+            short_addr_relay_value = 0;
+        }
     } else {
         ESP_LOGI(TAG, "Loaded short_ad_relay from NVS: %s (len=%zu)", short_addr_relay, len);
         if (convert_short_address(short_addr_relay, &short_addr_relay_value) != ESP_OK) {
@@ -294,8 +309,6 @@ static esp_err_t load_settings_from_nvs(void) {
              "mode=%s, ieee_addr_w100=%s, ieee_addr_relay=%s, short_addr_w100=%s, short_addr_relay=%s",
              last_heating_setpoint, input_high_hyst, input_low_hyst,
              mode_rout_coord, ieee_addr_w100, ieee_addr_relay, short_addr_w100, short_addr_relay);
-
-    return ESP_OK;
 }
 
 static void bdb_start_top_level_commissioning_wrapper(uint8_t mode_mask)
@@ -308,7 +321,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     uint32_t *p_sg_p = signal_struct->p_app_signal;
     esp_err_t err_status = signal_struct->esp_err_status;
     esp_zb_app_signal_type_t sig_type = *p_sg_p;
-    ESP_LOGI(TAG, "Zigbee signal received: %s, Status: %s (0x%x)", esp_zb_zdo_signal_to_string(sig_type), esp_err_to_name(err_status), err_status);
+    //ESP_LOGI(TAG, "Zigbee signal received: %s, Status: %s (0x%x)", esp_zb_zdo_signal_to_string(sig_type), esp_err_to_name(err_status), err_status);
 
     /* Gestion des signaux BDB */
     switch (sig_type) {
@@ -320,12 +333,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             ESP_LOGI(TAG, "Joined Zigbee network successfully (PAN ID: 0x%04hx, Channel: %d, Short Address: 0x%04hx)",
                     esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
             // set_sensor_mode("external");  /* Activer le mode external au démarrage */
-            if (first_boot) {
-                ESP_LOGI(TAG, "First boot detected, saving default settings to NVS");
-                save_settings_to_nvs();
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                esp_restart();
-            }
             read_thermostat_attributes();
             if (last_heating_setpoint != INT16_MIN) {
                 ESP_LOGI(TAG, "Applying setpoint from NVS: %.1f °C", last_heating_setpoint / 100.0);
@@ -1373,9 +1380,10 @@ static esp_err_t save_config_handler(httpd_req_t *req) {
 
             // Redémarrer uniquement si le mode a changé
             if (strcmp(current_mode, mode_rout_coord->valuestring) != 0) {
-                ESP_LOGI(TAG, "Mode changed from %s to %s, restarting...", current_mode, mode_rout_coord->valuestring);
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                esp_restart();
+                ESP_LOGI(TAG, "Mode changed from %s to %s", current_mode, mode_rout_coord->valuestring);
+                // ESP_LOGI(TAG, "Mode changed from %s to %s, restarting...", current_mode, mode_rout_coord->valuestring);
+                // vTaskDelay(pdMS_TO_TICKS(2000));
+                // esp_restart();
             } else {
                 ESP_LOGI(TAG, "No mode change, no restart needed");
             }
@@ -3030,47 +3038,24 @@ void watchdog_task(void *pvParameters)
 
 void app_main(void)
 {
-    // Configuration du timer LEDC
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode       = LEDC_LOW_SPEED_MODE,
-        .timer_num        = LEDC_TIMER,
-        .duty_resolution  = LEDC_TIMER_8_BIT,
-        .freq_hz          = 5000,
-        .clk_cfg          = LEDC_AUTO_CLK
-    };
-    ledc_timer_config(&ledc_timer);
-
-    // Configuration du canal LEDC
-    ledc_channel_config_t ledc_channel = {
-        .speed_mode     = LEDC_LOW_SPEED_MODE,
-        .channel        = LEDC_CHANNEL,
-        .timer_sel      = LEDC_TIMER,
-        .intr_type      = LEDC_INTR_DISABLE,
-        .gpio_num       = LED_GPIO,
-        .duty           = 128, // 50% luminosité
-        .hpoint         = 0
-    };
-    ledc_channel_config(&ledc_channel);
-
-    // Allumer la LED
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL, 128);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL);
-
-    esp_err_t err;
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
     };
     ESP_ERROR_CHECK(nvs_flash_init());
-    err = load_settings_from_nvs(); // Charger les paramètres au démarrage
+    load_settings_from_nvs(); // Charger les paramètres au démarrage
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Settings loaded from NVS successfully");
-        wifi_init();
-    } else {
-        ESP_LOGW(TAG, "Failed to load settings from NVS, presume first boot, connect zigbee then reboot");
-        first_boot = true;
-        xTaskCreate(esp_zb_task, "Zigbee_main", 8192 * 4, NULL, 2, &zb_task_handle);
-    }
+    wifi_init();
     xTaskCreate(watchdog_task, "watchdog_task", 2048, NULL, 1, NULL);
+
+    gpio_reset_pin(BLINK_GPIO);
+    gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
+    ESP_LOGI("LED", "C'est parti pour la led");
+    while (1) {
+        gpio_set_level(BLINK_GPIO, 1);  // Allume la LED
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        gpio_set_level(BLINK_GPIO, 0);  // Éteint la LED
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+
 }

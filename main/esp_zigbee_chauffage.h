@@ -11,9 +11,7 @@
 #include <ctype.h>
 
 // configuration LED onboard
-#define LED_GPIO 8
-#define LEDC_CHANNEL LEDC_CHANNEL_0
-#define LEDC_TIMER LEDC_TIMER_0
+#define BLINK_GPIO GPIO_NUM_8
 
 // Configuration Wi-Fi
 #define WIFI_SSID "Bbox-417260CF-Legacy"

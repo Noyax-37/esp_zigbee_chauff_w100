@@ -5,7 +5,7 @@ Prérequis
 
 Matériel : Une carte ESP32 compatible avec le firmware ESP-ZB.
 Logiciel :  Codage sous VS code
-            Environnement de développement ESP-IDF installé, version 5.4.2 (la version 5.5.1 créé des reboots intempestifs chez moi). 
+            Environnement de développement ESP-IDF installé, version 5.5.1 
             SDK Zigbee version 1.6.6
 Réseau Zigbee : Un coordinateur Zigbee. L'esp32 peut servir de routeur (voir les paramètres) mais non testé.
 
