@@ -3,7 +3,12 @@ Description
 Ce projet implémente un contrôleur de thermostat basé sur une puce ESP32, utilisant le protocole Zigbee pour communiquer avec la aqara w100 et un relais. L'application permet de surveiller la température, ajuster le setpoint (point de consigne) et contrôler l'état du relais via une interface web accessible sur le réseau local.
 Prérequis
 
-Matériel : Une carte ESP32 compatible avec le firmware ESP-ZB.
+Matériel : - Une carte ESP32 compatible avec le firmware ESP-ZB. 
+           - 3 LED adressables pour reconnaitre l'état de fonctionnement de l'esp32, au démarrage toutes les LED sont allumées au rouge en attente d'initialisation: 
+             - LED1 (bleu) : Indique l'état de la mémoire NVS (bleu clignotant: mémoire NVS vide ou certaines données manquantes, bleu fixe: OK).
+             - LED2 (jeune) : Indique l'état de la connexion wifi (jaune clignotant si non connecté, fixe si connecté).
+             - LED3 (verte) : Indique l'état de la connexion zigbee (même prinipe que la LED2 en vert).
+
 Logiciel :  Codage sous VS code
             Environnement de développement ESP-IDF installé, version 5.5.1 
             SDK Zigbee version 1.6.6

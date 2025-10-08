@@ -2489,7 +2489,6 @@ static void update_server_attributes(void)
     }
 
     // Mettre à jour l'attribut MeasuredValue du cluster Relative Humidity Measurement serveur
-    ESP_LOGI(TAG, "last_humidity = %d", last_humidity); // Log pour débogage
     uint16_t humidity_value = (last_humidity != INT16_MIN && last_humidity >= 0) ? last_humidity : 0;
     if (humidity_value > ESP_ZB_ZCL_REL_HUMIDITY_MEASUREMENT_MAX_MEASURED_VALUE_MAXIMUM) { // Plage : 0 à 10000
         ESP_LOGW(TAG, "Humidity value out of range: %u, setting to 0", humidity_value);
@@ -2508,7 +2507,6 @@ static void update_server_attributes(void)
     }
 
     // Mettre à jour l'attribut MeasuredValue du cluster Temperature Measurement serveur
-    ESP_LOGI(TAG, "last_temperature = %d", last_temperature); // Log pour débogage
     int16_t temp_value = (last_temperature != INT16_MIN && last_temperature >= ESP_ZB_ZCL_TEMP_MEASUREMENT_MIN_MEASURED_VALUE_MINIMUM) ? last_temperature : 0;
     status = esp_zb_zcl_set_attribute_val(
         HA_ONOFF_SWITCH_ENDPOINT,
@@ -2523,7 +2521,6 @@ static void update_server_attributes(void)
     }
 
     // Mettre à jour l'attribut LocalTemperature du cluster Thermostat serveur
-    ESP_LOGI(TAG, "thermostat last local temperature = %d", last_temperature); // Log pour débogage
     int16_t thermostat_temp = (last_temperature != INT16_MIN && last_temperature >= ESP_ZB_ZCL_TEMP_MEASUREMENT_MIN_MEASURED_VALUE_MINIMUM) ? last_temperature : 0;
     status = esp_zb_zcl_set_attribute_val(
         HA_ONOFF_SWITCH_ENDPOINT,
