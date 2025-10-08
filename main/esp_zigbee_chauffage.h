@@ -11,7 +11,11 @@
 #include <ctype.h>
 
 // configuration LED onboard
-#define BLINK_GPIO GPIO_NUM_8
+// Résolution RMT : 10 MHz pour WS2812
+#define LED_STRIP_RMT_RES_HZ  (10 * 1000 * 1000)
+#define LED_GPIO_PIN 10
+#define NUM_LEDS 3
+#define BLINK_PERIOD_US 500000  // 500 ms blink interval
 
 // Configuration Wi-Fi
 #define WIFI_SSID "Bbox-417260CF-Legacy"

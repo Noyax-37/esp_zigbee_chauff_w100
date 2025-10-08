@@ -33,7 +33,11 @@
 #include "zboss_api_buf.h"
 #include "esp_mac.h"
 #include "esp_zigbee_core.h"
-#include "driver/gpio.h"
+#include <stdio.h>
+#include "esp_err.h"
+#include "esp_log.h"
+#include "led_strip.h"
+#include "driver/rmt_tx.h"
 
 static const char *TAG = "ESP_ZIGBEE_CHAUFFAGE";
 
@@ -68,9 +72,17 @@ static uint8_t ieee_addr_w100_bytes[8] = {0};
 static uint8_t ieee_addr_relay_bytes[8] = {0};
 static uint16_t short_addr_w100_value = 0;
 static uint16_t short_addr_relay_value = 0;
+static bool led_blink = false;
+
+// Variables globales volatiles (pour accès multi-tâches)
+volatile bool blink_enabled = false;
+volatile uint8_t led_r = 0, led_g = 0, led_b = 0, led_nb = 0;
 
 /* Compteur global pour les headers Lumi */
 static uint8_t lumi_counter = 0x10;
+
+// Handle global pour la LED strip
+static led_strip_handle_t led_strip;
 
 // Prototypes de fonctions
 static void esp_zb_task(void *pvParameters);
@@ -104,6 +116,145 @@ static void send_pmtsd_command(uint8_t power, uint8_t mode, float temp, uint8_t 
 
 // //////////////////////////////////// fin tests /////////////////////////////////////
 
+// Structure pour l'état de chaque LED
+typedef struct {
+    uint8_t r, g, b;
+    bool blink;
+    bool is_on;  // État actuel pour le clignotement (true: couleur, false: éteint)
+} led_state_t;
+
+static led_state_t led_states[NUM_LEDS];
+
+// Mutex pour la synchronisation
+static SemaphoreHandle_t led_mutex;
+
+// Timer pour le clignotement
+static esp_timer_handle_t blink_timer;
+
+// Votre fonction d'initialisation
+void configure_led(void)
+{
+    ESP_LOGI(TAG, "Initialisation de la LED de l'ESP32");
+
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = LED_GPIO_PIN,  
+        .max_leds = NUM_LEDS,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,  // Format GRB pour WS2812
+        .led_model = LED_MODEL_WS2812,
+        .flags.invert_out = false,
+    };
+
+    led_strip_rmt_config_t rmt_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = LED_STRIP_RMT_RES_HZ,
+        .flags.with_dma = false,  // Pas de DMA sur ESP32-C6 pour simplicité
+    };
+
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    ESP_LOGI(TAG, "LED configurée avec succès");
+}
+
+// Mise à jour de la bande LED en fonction des états
+static void update_led_strip(void) {
+    if (xSemaphoreTake(led_mutex, portMAX_DELAY) == pdTRUE) {
+        for (int i = 0; i < NUM_LEDS; i++) {
+            if (led_states[i].blink && !led_states[i].is_on) {
+                led_strip_set_pixel(led_strip, i, 0, 0, 0);  // Éteint
+            } else {
+                led_strip_set_pixel(led_strip, i, led_states[i].g, led_states[i].r, led_states[i].b);
+            }
+        }
+        led_strip_refresh(led_strip);
+        xSemaphoreGive(led_mutex);
+    }
+}
+
+// Callback du timer pour gérer le clignotement
+static void blink_timer_callback(void *arg) {
+    if (xSemaphoreTake(led_mutex, portMAX_DELAY) == pdTRUE) {
+        bool any_blinking = false;
+        for (int i = 0; i < NUM_LEDS; i++) {
+            if (led_states[i].blink) {
+                led_states[i].is_on = !led_states[i].is_on;
+                any_blinking = true;
+            }
+        }
+        xSemaphoreGive(led_mutex);
+
+        // Mise à jour des LEDs
+        update_led_strip();
+
+        // Arrêter le timer si aucune LED ne clignote
+        if (!any_blinking) {
+            esp_timer_stop(blink_timer);
+        }
+    }
+}
+
+// Fonction pour définir l'état d'une LED
+void set_led(int index, uint8_t r, uint8_t g, uint8_t b, bool blink) {
+    if (index < 0 || index >= NUM_LEDS) {
+        ESP_LOGE(TAG, "Index LED invalide : %d", index);
+        return;
+    }
+
+    if (xSemaphoreTake(led_mutex, portMAX_DELAY) == pdTRUE) {
+        led_states[index].r = r;
+        led_states[index].g = g;
+        led_states[index].b = b;
+        led_states[index].blink = blink;
+        led_states[index].is_on = true;  // Commence allumée
+
+        // Vérifier si une LED doit clignoter
+        bool start_timer = false;
+        for (int i = 0; i < NUM_LEDS; i++) {
+            if (led_states[i].blink) {
+                start_timer = true;
+                break;
+            }
+        }
+
+        xSemaphoreGive(led_mutex);
+
+        // Gérer le timer
+        if (start_timer) {
+            esp_timer_start_periodic(blink_timer, BLINK_PERIOD_US);
+        } else {
+            esp_timer_stop(blink_timer);
+        }
+
+        // Mise à jour immédiate
+        update_led_strip();
+    }
+}
+
+// Initialisation du contrôle des LEDs (à appeler après configure_led)
+void init_led_control(void) {
+    // Initialiser le mutex
+    led_mutex = xSemaphoreCreateMutex();
+
+    // Initialiser les états des LEDs
+    for (int i = 0; i < NUM_LEDS; i++) {
+        led_states[i].r = 10;
+        led_states[i].g = 0;
+        led_states[i].b = 0;
+        led_states[i].blink = false;
+        led_states[i].is_on = true;
+    }
+
+    // Configurer le timer pour le clignotement
+    const esp_timer_create_args_t timer_args = {
+        .callback = &blink_timer_callback,
+        .name = "blink_timer"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &blink_timer));
+
+    // Appeler votre fonction d'initialisation
+    configure_led();
+
+    // Mise à jour initiale
+    update_led_strip();
+}
 
 esp_err_t convert_short_address(const char *addr_str, uint16_t *out_value) {
     if (addr_str == NULL || strlen(addr_str) != 6 || strncmp(addr_str, "0x", 2) != 0) {
@@ -158,6 +309,8 @@ esp_err_t convert_ieee_address(const char *addr_str, uint8_t out_array[8]) {
 }
 
 static void save_settings_to_nvs(void) {
+    bool blink = false;
+    set_led(0, 0, 0, 10, true); // bleu clignotant
     nvs_handle_t nvs_handle;
     esp_err_t err;
 
@@ -169,25 +322,30 @@ static void save_settings_to_nvs(void) {
 
     err = nvs_set_i16(nvs_handle, "setpoint", last_heating_setpoint);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGE(TAG, "Failed to save setpoint: %s", esp_err_to_name(err));
     }
 
     err = nvs_set_u16(nvs_handle, "high_hyst", input_high_hyst);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGE(TAG, "Failed to save high_hyst: %s", esp_err_to_name(err));
     }
 
     err = nvs_set_u16(nvs_handle, "low_hyst", input_low_hyst);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGE(TAG, "Failed to save low_hyst: %s", esp_err_to_name(err));
     }
 
     err = nvs_commit(nvs_handle);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
     }
 
     nvs_close(nvs_handle);
+    set_led(0, 0, 0, 10, blink);
     ESP_LOGI(TAG, "Settings saved to NVS: setpoint=%d, high_hyst=%u, low_hyst=%u", 
              last_heating_setpoint, input_high_hyst, input_low_hyst);
 }
@@ -195,6 +353,8 @@ static void save_settings_to_nvs(void) {
 static void load_settings_from_nvs(void) {
     nvs_handle_t nvs_handle;
     esp_err_t err;
+    bool blink = false;
+    set_led(0, 0, 0, 10, true); // bleu clignotant
 
     err = nvs_open("storage", NVS_READONLY, &nvs_handle);
     if (err != ESP_OK) {
@@ -212,18 +372,21 @@ static void load_settings_from_nvs(void) {
 
     err = nvs_get_i16(nvs_handle, "setpoint", &last_heating_setpoint);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGW(TAG, "Failed to read setpoint: %s, using default (%u)", esp_err_to_name(err), HEATING_SETPOINT_DEFAULT);
         last_heating_setpoint = HEATING_SETPOINT_DEFAULT;
     }
 
     err = nvs_get_u16(nvs_handle, "high_hyst", &input_high_hyst);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGW(TAG, "Failed to read high_hyst: %s, using default (%u)", esp_err_to_name(err), HIGH_HYST_DEFAULT);
         input_high_hyst = HIGH_HYST_DEFAULT;
     }
 
     err = nvs_get_u16(nvs_handle, "low_hyst", &input_low_hyst);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGW(TAG, "Failed to read low_hyst: %s, using default (%u)", esp_err_to_name(err), LOW_HYST_DEFAULT);
         input_low_hyst = LOW_HYST_DEFAULT;
     }
@@ -231,6 +394,7 @@ static void load_settings_from_nvs(void) {
     size_t len = sizeof(ieee_addr_w100);
     err = nvs_get_str(nvs_handle, "ieee_addr_w100", ieee_addr_w100, &len);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGW(TAG, "Failed to read ieee_addr_w100: %s, using default", esp_err_to_name(err));
         strcpy(ieee_addr_w100, "0x54ef441001263ef3");
         if (convert_ieee_address(ieee_addr_w100, ieee_addr_w100_bytes) != ESP_OK) {
@@ -248,6 +412,7 @@ static void load_settings_from_nvs(void) {
     len = sizeof(ieee_addr_relay);
     err = nvs_get_str(nvs_handle, "ieee_addr_relay", ieee_addr_relay, &len);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGW(TAG, "Failed to read ieee_addr_relay: %s, using default", esp_err_to_name(err));
         strcpy(ieee_addr_relay, "0x7c2c67fffe75c28c");
         if (convert_ieee_address(ieee_addr_relay, ieee_addr_relay_bytes) != ESP_OK) {
@@ -265,6 +430,7 @@ static void load_settings_from_nvs(void) {
     len = sizeof(short_addr_w100);
     err = nvs_get_str(nvs_handle, "short_ad_w100", short_addr_w100, &len);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGW(TAG, "Failed to read short_ad_w100: %s, using default", esp_err_to_name(err));
         strcpy(short_addr_w100, "0xC0E4");
         if (convert_short_address(short_addr_w100, &short_addr_w100_value) != ESP_OK) {
@@ -282,6 +448,7 @@ static void load_settings_from_nvs(void) {
     len = sizeof(short_addr_relay);
     err = nvs_get_str(nvs_handle, "short_ad_relay", short_addr_relay, &len);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGW(TAG, "Failed to read short_ad_relay: %s, using default", esp_err_to_name(err));
         strcpy(short_addr_relay, "0xB377");
         if (convert_short_address(short_addr_relay, &short_addr_relay_value) != ESP_OK) {
@@ -299,11 +466,14 @@ static void load_settings_from_nvs(void) {
     len = sizeof(mode_rout_coord);
     err = nvs_get_str(nvs_handle, "mode", mode_rout_coord, &len);
     if (err != ESP_OK) {
+        blink = true;
         ESP_LOGW(TAG, "Failed to read mode: %s, using default 'router'", esp_err_to_name(err));
         strcpy(mode_rout_coord, "router");
     }
 
     nvs_close(nvs_handle);
+
+    set_led(0, 0, 0, 10, blink);
 
     ESP_LOGI(TAG, "Settings loaded from NVS: setpoint=%d, high_hyst=%u, low_hyst=%u, "
              "mode=%s, ieee_addr_w100=%s, ieee_addr_relay=%s, short_addr_w100=%s, short_addr_relay=%s",
@@ -328,8 +498,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
     case ESP_ZB_BDB_SIGNAL_STEERING:
+        set_led(2, 0, 10, 0, true); // led 3 vert clignotant
         ESP_LOGI(TAG, "Signal: %s, Status: %s (0x%x)", esp_zb_zdo_signal_to_string(sig_type), esp_err_to_name(err_status), err_status);
         if (err_status == ESP_OK) {
+           set_led(2, 0, 10, 0, false);
             ESP_LOGI(TAG, "Joined Zigbee network successfully (PAN ID: 0x%04hx, Channel: %d, Short Address: 0x%04hx)",
                     esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
             // set_sensor_mode("external");  /* Activer le mode external au démarrage */
@@ -1102,6 +1274,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                               int32_t event_id, void* event_data)
 {
     esp_netif_t *netif = (esp_netif_t *)arg;
+    led_blink = true;
+    set_led(1, 10, 10, 0, true);
+
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
@@ -1123,6 +1298,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             }
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        set_led(1, 10, 10, 0, false);
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Connected to Wi-Fi, IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
@@ -3038,6 +3214,15 @@ void watchdog_task(void *pvParameters)
 
 void app_main(void)
 {
+    init_led_control();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    set_led(0, 10, 0, 0, false);   // Rouge, clignotant
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    set_led(1, 10, 0, 0, false);   // Rouge, clignotant
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    set_led(2, 10, 0, 0, false);   // Rouge, clignotant
+    vTaskDelay(pdMS_TO_TICKS(2000));
+        
     esp_zb_platform_config_t config = {
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
@@ -3047,15 +3232,4 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
     wifi_init();
     xTaskCreate(watchdog_task, "watchdog_task", 2048, NULL, 1, NULL);
-
-    gpio_reset_pin(BLINK_GPIO);
-    gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
-    ESP_LOGI("LED", "C'est parti pour la led");
-    while (1) {
-        gpio_set_level(BLINK_GPIO, 1);  // Allume la LED
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        gpio_set_level(BLINK_GPIO, 0);  // Éteint la LED
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-
 }
