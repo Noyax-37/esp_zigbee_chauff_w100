@@ -1100,6 +1100,15 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_MULTI_INPUT_PRESENT_VALUE_ID) {
                 uint16_t button_value = *(uint16_t *)message->attribute.data.value; // 0= hold, 1=single, 2= double, 255= release after hold
                 ESP_LOGI(TAG, "MultiInput Present Value: %d (endpoint %d)", button_value, message->src_endpoint); // endpoint 1=+, 2=center, 3=-
+                if (button_value == 0) { 
+                    if (message->src_endpoint == 1) { 
+                        ESP_LOGI(TAG, "Button + pressed (hold_plus, endpoint 1) => no action");
+                    } else if (message->src_endpoint == 2) {
+                        ESP_LOGI(TAG, "Button center pressed (hold_center, endpoint 2) = set thermostat to OFF or ON");
+                    } else if (message->src_endpoint == 3) {
+                        ESP_LOGI(TAG, "Button - pressed (hold_minus, endpoint 3) => no action");
+                    }
+                }
                 if (button_value == 1) { 
                     if (message->src_endpoint == 1) { 
                         ESP_LOGI(TAG, "Button + pressed (single_plus, endpoint 1)");
@@ -1150,13 +1159,13 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
                         }
                     }
                 }
-                if (button_value == 0) { 
+                if (button_value == 255) { 
                     if (message->src_endpoint == 1) { 
-                        ESP_LOGI(TAG, "Button + pressed (hold_plus, endpoint 1) => no action");
+                        ESP_LOGI(TAG, "Button + released after hold => no action");
                     } else if (message->src_endpoint == 2) {
-                        ESP_LOGI(TAG, "Button center pressed (hold_center, endpoint 2) = set thermostat to OFF or ON");
+                        ESP_LOGI(TAG, "Button center released after hold => no action");
                     } else if (message->src_endpoint == 3) {
-                        ESP_LOGI(TAG, "Button - pressed (hold_minus, endpoint 3) => no action");
+                        ESP_LOGI(TAG, "Button - released after hold => no action");
                     }
                 }
             }
@@ -2607,8 +2616,6 @@ static void update_server_attributes(void)
             on_off_value = (relay_actual_state == 1) ? 0 : 1;
         }
 
-        ESP_LOGI(TAG, "Update server attribute 2"); // Log pour débogage
-
         status = esp_zb_zcl_set_attribute_val(
             HA_ONOFF_SWITCH_ENDPOINT,
             ESP_ZB_ZCL_CLUSTER_ID_THERMOSTAT,
@@ -2620,9 +2627,6 @@ static void update_server_attributes(void)
         if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
             ESP_LOGW(TAG, "Failed to update Thermostat RunningState attribute: status 0x%02x", status);
         }
-        
-        ESP_LOGI(TAG, "Update server attribute 2bis"); // Log pour débogage
-
     }
     // Mettre à jour l'attribut MeasuredValue du cluster Relative Humidity Measurement serveur
     if (humidity_value != ((last_humidity != INT16_MIN && last_humidity >= 0) ? last_humidity : 0)) {
@@ -2644,9 +2648,6 @@ static void update_server_attributes(void)
             ESP_LOGW(TAG, "Failed to update Humidity MeasuredValue attribute: status 0x%02x", status);
             humidity_value = 0;
         }
-
-        ESP_LOGI(TAG, "Update server attribute 3"); // Log pour débogage
-
     }
 
     // Mettre à jour l'attribut MeasuredValue du cluster Temperature Measurement serveur
@@ -2667,9 +2668,6 @@ static void update_server_attributes(void)
             temp_value = 0;
         }
 
-
-        ESP_LOGI(TAG, "Update server attribute 4"); // Log pour débogage
-
         // Mettre à jour l'attribut LocalTemperature du cluster Thermostat serveur
         status = esp_zb_zcl_set_attribute_val(
             HA_ONOFF_SWITCH_ENDPOINT,
@@ -2682,10 +2680,6 @@ static void update_server_attributes(void)
         if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
             ESP_LOGW(TAG, "Failed to update Thermostat LocalTemperature attribute: status 0x%02x", status);
         }
-
-
-        ESP_LOGI(TAG, "Update server attribute 4bis"); // Log pour débogage
-
     }
 
     // mettre à jour l'attribut heating setpoint du cluster Thermostat serveur
@@ -2705,9 +2699,6 @@ static void update_server_attributes(void)
             ESP_LOGW(TAG, "Failed to update Thermostat OccupiedHeatingSetpoint value: %u attribute: status 0x%02x", heat_setpoint, status);
             heat_setpoint = HEATING_SETPOINT_DEFAULT;
         }
-
-        ESP_LOGI(TAG, "Update server attribute 6"); // Log pour débogage
-
     }
 
     if (updated){
