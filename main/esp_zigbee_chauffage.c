@@ -1097,32 +1097,66 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
                 ESP_LOG_BUFFER_HEX(TAG, message->attribute.data.value, message->attribute.data.size);
             }
         } else if (message->cluster == ESP_ZB_ZCL_CLUSTER_ID_MULTI_INPUT) {
-            if (message->attribute.id == ESP_ZB_ZCL_ATTR_MULTI_VALUE_PRESENT_VALUE_ID) {
-                uint16_t button_value = *(uint16_t *)message->attribute.data.value;
-                if (button_value == 1) {
-                    if (message->src_endpoint == 1) {
+            if (message->attribute.id == ESP_ZB_ZCL_ATTR_MULTI_INPUT_PRESENT_VALUE_ID) {
+                uint16_t button_value = *(uint16_t *)message->attribute.data.value; // 0= hold, 1=single, 2= double, 255= release after hold
+                ESP_LOGI(TAG, "MultiInput Present Value: %d (endpoint %d)", button_value, message->src_endpoint); // endpoint 1=+, 2=center, 3=-
+                if (button_value == 1) { 
+                    if (message->src_endpoint == 1) { 
                         ESP_LOGI(TAG, "Button + pressed (single_plus, endpoint 1)");
                         if (last_heating_setpoint != INT16_MIN) {
                             int16_t new_setpoint = last_heating_setpoint + 10;
                             set_external_temperature(new_setpoint);
-                            send_pmtsd_command(0, 1, (float)new_setpoint / 100.0, 0, 1);
+                            // send_pmtsd_command(0, 1, (float)new_setpoint / 100.0, 0, 1);
                             last_heating_setpoint = new_setpoint;
                             save_settings_to_nvs();
                             ESP_LOGI(TAG, "Setpoint increased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
                         }
                     } else if (message->src_endpoint == 2) {
-                        ESP_LOGI(TAG, "Button center pressed (single_center, endpoint 2)");
-                        send_on_off_command(relay_actual_state == 1 ? ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID : ESP_ZB_ZCL_CMD_ON_OFF_ON_ID);
+                        ESP_LOGI(TAG, "Button center pressed (single_center, endpoint 2) => no action");
                     } else if (message->src_endpoint == 3) {
                         ESP_LOGI(TAG, "Button - pressed (single_minus, endpoint 3)");
                         if (last_heating_setpoint != INT16_MIN) {
                             int16_t new_setpoint = last_heating_setpoint - 10;
                             set_external_temperature(new_setpoint);
-                            send_pmtsd_command(0, 1, (float)new_setpoint / 100.0, 0, 1);
+                            // send_pmtsd_command(0, 1, (float)new_setpoint / 100.0, 0, 1);
                             last_heating_setpoint = new_setpoint;
                             save_settings_to_nvs();
                             ESP_LOGI(TAG, "Setpoint decreased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
                         }
+                    }
+                }
+                if (button_value == 2) { 
+                    if (message->src_endpoint == 1) { 
+                        ESP_LOGI(TAG, "Button + pressed (double_plus, endpoint 1) = +1°C to setpoint");
+                        if (last_heating_setpoint != INT16_MIN) {
+                            int16_t new_setpoint = last_heating_setpoint + 100;
+                            set_external_temperature(new_setpoint);
+                            // send_pmtsd_command(0, 1, (float)new_setpoint / 100.0, 0, 1);
+                            last_heating_setpoint = new_setpoint;
+                            save_settings_to_nvs();
+                            ESP_LOGI(TAG, "Setpoint increased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
+                        }
+                    } else if (message->src_endpoint == 2) {
+                        ESP_LOGI(TAG, "Button center pressed (double_center, endpoint 2) => no action");
+                    } else if (message->src_endpoint == 3) {
+                        ESP_LOGI(TAG, "Button - pressed (single_minus, endpoint 3) = -1°C to setpoint");
+                        if (last_heating_setpoint != INT16_MIN) {
+                            int16_t new_setpoint = last_heating_setpoint - 100;
+                            set_external_temperature(new_setpoint);
+                            // send_pmtsd_command(0, 1, (float)new_setpoint / 100.0, 0, 1);
+                            last_heating_setpoint = new_setpoint;
+                            save_settings_to_nvs();
+                            ESP_LOGI(TAG, "Setpoint decreased to %d.%d °C", new_setpoint / 100, abs(new_setpoint % 100));
+                        }
+                    }
+                }
+                if (button_value == 0) { 
+                    if (message->src_endpoint == 1) { 
+                        ESP_LOGI(TAG, "Button + pressed (hold_plus, endpoint 1) => no action");
+                    } else if (message->src_endpoint == 2) {
+                        ESP_LOGI(TAG, "Button center pressed (hold_center, endpoint 2) = set thermostat to OFF or ON");
+                    } else if (message->src_endpoint == 3) {
+                        ESP_LOGI(TAG, "Button - pressed (hold_minus, endpoint 3) => no action");
                     }
                 }
             }
@@ -1216,7 +1250,7 @@ static void write_thermostat_attributes(int16_t new_setpoint, uint16_t new_high_
     // Mettre à jour le setpoint via Zigbee si nécessaire
     if (setpoint_updated) {
         set_external_temperature(new_setpoint);
-        send_pmtsd_command(0, 1, (float)(new_setpoint) / 100.0, 0, 1);
+        // send_pmtsd_command(0, 1, (float)(new_setpoint) / 100.0, 0, 1);
         last_heating_setpoint = new_setpoint; // Mettre à jour localement
         save_settings_to_nvs(); // Sauvegarder dans NVS
         test_setpoint();
@@ -1249,117 +1283,117 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 {
     esp_err_t ret = ESP_OK;
     switch (callback_id) {
-    case ESP_ZB_CORE_REPORT_ATTR_CB_ID:
-        ret = zb_attribute_reporting_handler((esp_zb_zcl_report_attr_message_t *)message);
-        break;
-    case ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID:
-    {
-        esp_zb_zcl_cmd_default_resp_message_t *resp = (esp_zb_zcl_cmd_default_resp_message_t *)message;
-        if (resp->info.src_address.u.short_addr == short_addr_w100_value && resp->info.cluster == 0xFCC0) {
-            if (resp->status_code == 0) {
-                ESP_LOGI(TAG, "Write command to thermostat (0x%04x) succeeded", short_addr_w100_value);
-                if (update_status && update_status_allocated) {
-                    ESP_LOGI(TAG, "Freeing update_status at address %p", update_status);
-                    free(update_status);
-                    update_status = NULL;
-                    update_status_allocated = false;
-                }
-                asprintf(&update_status, "Setpoint modifié avec succès");
-                update_status_allocated = true;
-                ESP_LOGI(TAG, "Update status set to: %s", update_status);
-                // Lancer la tâche pour réinitialiser update_status après 5 secondes
-                xTaskCreate(reset_update_status_task, "Reset_Update_Status", 4096, NULL, 1, NULL);
-                read_thermostat_attributes();
-            } else {
-                ESP_LOGE(TAG, "Write failed for thermostat (0x%04x), status: 0x%02x", short_addr_w100_value, resp->status_code);
-                if (update_status && update_status_allocated) {
-                    ESP_LOGI(TAG, "Freeing update_status at address %p due to write failure", update_status);
-                    free(update_status);
-                    update_status = NULL;
-                    update_status_allocated = false;
-                }
-                asprintf(&update_status, "Échec de l'écriture, statut: 0x%02x", resp->status_code);
-                update_status_allocated = true;
-                // Lancer la tâche pour réinitialiser update_status après 5 secondes
-                xTaskCreate(reset_update_status_task, "Reset_Update_Status", 4096, NULL, 1, NULL);
-                read_thermostat_attributes();
-            }
-        } else if (resp->info.src_address.u.short_addr == short_addr_relay_value && resp->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
-            ESP_LOGI(TAG, "Command %s (0x%02x) to Relay (0x%04x) %s",
-                    (resp->resp_to_cmd == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", resp->resp_to_cmd,
-                    short_addr_relay_value, (resp->status_code == 0) ? "succeeded" : "failed");
-            // set_external_humidity((resp->resp_to_cmd == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? 9900 : 0); // 99% si le relais est ON, sinon 0%
-        }
-        break;
-    }
-    case ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID:
-    {
-        esp_zb_zcl_cmd_read_attr_resp_message_t *resp = (esp_zb_zcl_cmd_read_attr_resp_message_t *)message;
-        ESP_LOGI(TAG, "Received Read Attribute Response from address(0x%04x) endpoint(%d) cluster(0x%04x)",
-                resp->info.src_address.u.short_addr, resp->info.src_endpoint, resp->info.cluster);
-        esp_zb_zcl_read_attr_resp_variable_t *variable = resp->variables;
-        while (variable != NULL) {
-            if (variable->status == ESP_ZB_ZCL_STATUS_SUCCESS) {
-                if (resp->info.cluster == 0xFCC0){
-                    ESP_LOGI(TAG, "0xFFC0 Attribute ID: 0x%04x, Type: 0x%02x, Status: 0x%02x, Value Size: %d, Value: %p", 
-                        variable->attribute.id, variable->attribute.data.type, variable->status, variable->attribute.data.size, variable->attribute.data.value);
-                    if (variable->attribute.id == 0x0172) {
-                        uint8_t mode_ext_int = *(uint8_t *)variable->attribute.data.value;
-                        const char *mode_str = (mode_ext_int == 0x02 || mode_ext_int == 0x03) ? "external" : "internal";
-                        ESP_LOGI(TAG, "Sensor mode: %s (raw: %u)", mode_str, mode_ext_int);
-                        if (mode_ext_int != 0x02 && mode_ext_int != 0x03) {
-                            ESP_LOGW(TAG, "Thermostat not in external sensor mode, setting to external");
-                            set_sensor_mode("external");
-                        }
+        case ESP_ZB_CORE_REPORT_ATTR_CB_ID:
+            ret = zb_attribute_reporting_handler((esp_zb_zcl_report_attr_message_t *)message);
+            break;
+        case ESP_ZB_CORE_CMD_DEFAULT_RESP_CB_ID:
+        {
+            esp_zb_zcl_cmd_default_resp_message_t *resp = (esp_zb_zcl_cmd_default_resp_message_t *)message;
+            if (resp->info.src_address.u.short_addr == short_addr_w100_value && resp->info.cluster == 0xFCC0) {
+                if (resp->status_code == 0) {
+                    ESP_LOGI(TAG, "Write command to thermostat (0x%04x) succeeded", short_addr_w100_value);
+                    if (update_status && update_status_allocated) {
+                        ESP_LOGI(TAG, "Freeing update_status at address %p", update_status);
+                        free(update_status);
+                        update_status = NULL;
+                        update_status_allocated = false;
                     }
-                    if (variable->attribute.id == 0xFFF2) {
-                        uint8_t *data = (uint8_t *)variable->attribute.data.value;
-                        uint16_t data_len = variable->attribute.data.size;
-                        ESP_LOGI(TAG, "Reception sur attribut 0xFFF2, length: %d", data_len);
-                        //ESP_LOG_BUFFER_HEX(TAG, data, data_len);
-                        // Vérifier si c'est une requête PMTSD
-                        if (data_len >= 4 && data[data_len - 4] == 0x08 && data[data_len - 3] == 0x00 &&
-                            data[data_len - 2] == 0x08 && data[data_len - 1] == 0x44) {
-                            ESP_LOGI(TAG, "Detected PMTSD request, sending response");
-                            send_pmtsd_command(0, 1, (float) last_heating_setpoint / 100.0, 0, 1);
-                        } else {
-                            // Tenter de décoder comme ASCII (PMTSD)
-                            char pmtsd_str[32] = {0};
-                            if (data_len < sizeof(pmtsd_str) && data[0] >= 'P' && data[0] <= 'Z') {
-                                memcpy(pmtsd_str, data, data_len);
-                                ESP_LOGI(TAG, "PMTSD data: %s", pmtsd_str);
-                                char *token = strtok(pmtsd_str, "_");
-                                while (token != NULL) {
-                                    if (token[0] == 'P') ESP_LOGI(TAG, "Power: %s", token + 1);
-                                    else if (token[0] == 'M') ESP_LOGI(TAG, "Mode: %s", token + 1);
-                                    else if (token[0] == 'T') ESP_LOGI(TAG, "Temperature: %s", token + 1);
-                                    else if (token[0] == 'S') ESP_LOGI(TAG, "Speed: %s", token + 1);
-                                    else if (token[0] == 'D') ESP_LOGI(TAG, "D: %s", token + 1);
-                                    token = strtok(NULL, "_");
-                                }
+                    asprintf(&update_status, "Setpoint modifié avec succès");
+                    update_status_allocated = true;
+                    ESP_LOGI(TAG, "Update status set to: %s", update_status);
+                    // Lancer la tâche pour réinitialiser update_status après 5 secondes
+                    xTaskCreate(reset_update_status_task, "Reset_Update_Status", 4096, NULL, 1, NULL);
+                    read_thermostat_attributes();
+                } else {
+                    ESP_LOGE(TAG, "Write failed for thermostat (0x%04x), status: 0x%02x", short_addr_w100_value, resp->status_code);
+                    if (update_status && update_status_allocated) {
+                        ESP_LOGI(TAG, "Freeing update_status at address %p due to write failure", update_status);
+                        free(update_status);
+                        update_status = NULL;
+                        update_status_allocated = false;
+                    }
+                    asprintf(&update_status, "Échec de l'écriture, statut: 0x%02x", resp->status_code);
+                    update_status_allocated = true;
+                    // Lancer la tâche pour réinitialiser update_status après 5 secondes
+                    xTaskCreate(reset_update_status_task, "Reset_Update_Status", 4096, NULL, 1, NULL);
+                    read_thermostat_attributes();
+                }
+            } else if (resp->info.src_address.u.short_addr == short_addr_relay_value && resp->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
+                ESP_LOGI(TAG, "Command %s (0x%02x) to Relay (0x%04x) %s",
+                        (resp->resp_to_cmd == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF", resp->resp_to_cmd,
+                        short_addr_relay_value, (resp->status_code == 0) ? "succeeded" : "failed");
+                // set_external_humidity((resp->resp_to_cmd == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? 9900 : 0); // 99% si le relais est ON, sinon 0%
+            }
+            break;
+        }
+        case ESP_ZB_CORE_CMD_READ_ATTR_RESP_CB_ID:
+        {
+            esp_zb_zcl_cmd_read_attr_resp_message_t *resp = (esp_zb_zcl_cmd_read_attr_resp_message_t *)message;
+            ESP_LOGI(TAG, "Received Read Attribute Response from address(0x%04x) endpoint(%d) cluster(0x%04x)",
+                    resp->info.src_address.u.short_addr, resp->info.src_endpoint, resp->info.cluster);
+            esp_zb_zcl_read_attr_resp_variable_t *variable = resp->variables;
+            while (variable != NULL) {
+                if (variable->status == ESP_ZB_ZCL_STATUS_SUCCESS) {
+                    if (resp->info.cluster == 0xFCC0){
+                        ESP_LOGI(TAG, "0xFFC0 Attribute ID: 0x%04x, Type: 0x%02x, Status: 0x%02x, Value Size: %d, Value: %p", 
+                            variable->attribute.id, variable->attribute.data.type, variable->status, variable->attribute.data.size, variable->attribute.data.value);
+                        if (variable->attribute.id == 0x0172) {
+                            uint8_t mode_ext_int = *(uint8_t *)variable->attribute.data.value;
+                            const char *mode_str = (mode_ext_int == 0x02 || mode_ext_int == 0x03) ? "external" : "internal";
+                            ESP_LOGI(TAG, "Sensor mode: %s (raw: %u)", mode_str, mode_ext_int);
+                            if (mode_ext_int != 0x02 && mode_ext_int != 0x03) {
+                                ESP_LOGW(TAG, "Thermostat not in external sensor mode, setting to external");
+                                set_sensor_mode("external");
+                            }
+                        }
+                        if (variable->attribute.id == 0xFFF2) {
+                            uint8_t *data = (uint8_t *)variable->attribute.data.value;
+                            uint16_t data_len = variable->attribute.data.size;
+                            ESP_LOGI(TAG, "Reception sur attribut 0xFFF2, length: %d", data_len);
+                            //ESP_LOG_BUFFER_HEX(TAG, data, data_len);
+                            // Vérifier si c'est une requête PMTSD
+                            if (data_len >= 4 && data[data_len - 4] == 0x08 && data[data_len - 3] == 0x00 &&
+                                data[data_len - 2] == 0x08 && data[data_len - 1] == 0x44) {
+                                ESP_LOGI(TAG, "Detected PMTSD request, sending response");
+                                send_pmtsd_command(0, 1, (float) last_heating_setpoint / 100.0, 0, 1);
                             } else {
-                                // Rapport non-ASCII (par exemple, état HVAC)
-                                ESP_LOGI(TAG, "Non-ASCII PMTSD report, length: %d", data_len);
-                                // Logique inspirée de DecodePMTSD_FD (à implémenter selon le convertisseur)
-                                if (data_len == 9 && data[0] == 0x02 && data[1] == 0x41 && data[2] == 0x2f) {
-                                    // Exemple hypothétique basé sur la structure du rapport
-                                    ESP_LOGI(TAG, "Possible HVAC state report");
-                                    // Ajouter une logique pour extraire des informations spécifiques
+                                // Tenter de décoder comme ASCII (PMTSD)
+                                char pmtsd_str[32] = {0};
+                                if (data_len < sizeof(pmtsd_str) && data[0] >= 'P' && data[0] <= 'Z') {
+                                    memcpy(pmtsd_str, data, data_len);
+                                    ESP_LOGI(TAG, "PMTSD data: %s", pmtsd_str);
+                                    char *token = strtok(pmtsd_str, "_");
+                                    while (token != NULL) {
+                                        if (token[0] == 'P') ESP_LOGI(TAG, "Power: %s", token + 1);
+                                        else if (token[0] == 'M') ESP_LOGI(TAG, "Mode: %s", token + 1);
+                                        else if (token[0] == 'T') ESP_LOGI(TAG, "Temperature: %s", token + 1);
+                                        else if (token[0] == 'S') ESP_LOGI(TAG, "Speed: %s", token + 1);
+                                        else if (token[0] == 'D') ESP_LOGI(TAG, "D: %s", token + 1);
+                                        token = strtok(NULL, "_");
+                                    }
+                                } else {
+                                    // Rapport non-ASCII (par exemple, état HVAC)
+                                    ESP_LOGI(TAG, "Non-ASCII PMTSD report, length: %d", data_len);
+                                    // Logique inspirée de DecodePMTSD_FD (à implémenter selon le convertisseur)
+                                    if (data_len == 9 && data[0] == 0x02 && data[1] == 0x41 && data[2] == 0x2f) {
+                                        // Exemple hypothétique basé sur la structure du rapport
+                                        ESP_LOGI(TAG, "Possible HVAC state report");
+                                        // Ajouter une logique pour extraire des informations spécifiques
+                                    }
                                 }
                             }
                         }
                     }
+                } else {
+                    ESP_LOGW(TAG, "Attribute 0x%04x read failed with status 0x%02x", variable->attribute.id, variable->status);
                 }
-            } else {
-                ESP_LOGW(TAG, "Attribute 0x%04x read failed with status 0x%02x", variable->attribute.id, variable->status);
+                variable = variable->next;
             }
-            variable = variable->next;
+            break;
         }
-        break;
-    }
-    default:
-        ESP_LOGW(TAG, "Received Zigbee action(0x%x) callback", callback_id);
-        break;
+        default:
+            ESP_LOGW(TAG, "Received Zigbee action(0x%x) callback", callback_id);
+            break;
     }
     return ret;
 }
@@ -2473,7 +2507,7 @@ static void esp_zb_task(void *pvParameters)
         ESP_LOGE(TAG, "Failed to add Multistate Input StatusFlags attribute: status 0x%02x", status);
         return;
     }
-    uint16_t number_of_states = 9; // 3 boutons à 3 états pour correspondre aux boutons
+    uint16_t number_of_states = 12; // 3 boutons à 4 états pour correspondre aux boutons
     status = esp_zb_multistate_input_cluster_add_attr(esp_zb_multistate_input_server_cluster, 
                                                      ESP_ZB_ZCL_ATTR_MULTI_INPUT_NUMBER_OF_STATES_ID, 
                                                      &number_of_states);
