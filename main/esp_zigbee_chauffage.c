@@ -3172,8 +3172,6 @@ static void set_external_temperature(int16_t setpoint)
     union { float fl; uint32_t u; } fu;
     fu.fl = f;
     uint8_t temp_buf[4] = { (fu.u >> 24) & 0xFF, (fu.u >> 16) & 0xFF, (fu.u >> 8) & 0xFF, fu.u & 0xFF };
-    ESP_LOGI(TAG, "Setpoint float value: %.2f, encoded as: %02x %02x %02x %02x", 
-             f, temp_buf[0], temp_buf[1], temp_buf[2], temp_buf[3]);
 
     /* Params */
     uint8_t params[8 + 1 + 1 + 1 + 1 + 4];  /* Size 16 */

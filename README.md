@@ -61,10 +61,11 @@ Une fois les adresses zigbee paramétré et retour à l'interface du départ alo
 Fonctionnalités :
 Affichage de la température, du setpoint, et de l'état du relais sur l'interface web + réglage de certains paramètres.
 Sur le W100:
-  - Si la fonction thermostat est en service: mise au point du setpoint via les boutons "+" et "-" un appui simple ajoute ou retire 0.1°C au setpoint et un double appui de même mais avec 1°C. 
+  - Si la fonction thermostat est en service: le setpoint est affiché en température comme "secondary" sur l'écran principal et l'humidité du secondary sert à afficher l'état du relais: 0% = chauffage non actif, 99% = chauffage actif.
+  - mise au point du setpoint via les boutons "+" et "-" un appui simple ajoute ou retire 0.1°C au setpoint et un double appui de même mais avec 1°C. 
   - Un appui long au centre met en service ou éteint la fonction thermostat.
 
-  
+
 Contrôle automatique du relais basé sur la température et le setpoint (avec hystérésis par défaut à 0.1°C si non configuré).
 Possibilité de "jouer" avec la ligne du milieu du W100 mais pas encore exploité par le partie thermostat car la température ne peut pas être réglée au 10ème de degré celsius.
 
