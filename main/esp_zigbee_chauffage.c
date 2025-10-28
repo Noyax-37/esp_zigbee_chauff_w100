@@ -125,12 +125,7 @@ static void send_hvac_off_command(void);
 static void send_pmtsd_command(uint8_t power, uint8_t mode, float temp, uint8_t speed, uint8_t display);
 static void configure_relay_onoff_reporting(void);
 static void configure_aqara_w100_reporting(void);
-
-// ////////////////////////////// zone de test ///////////////////////////////
-
-
-
-// //////////////////////////////////// fin tests /////////////////////////////////////
+static void configure_device_reporting(void);
 
 // Structure pour l'état de chaque LED
 typedef struct {
@@ -517,12 +512,13 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         set_led(2, 0, 10, 0, true); // led 3 vert clignotant
         ESP_LOGI(TAG, "Signal: %s, Status: %s (0x%x)", esp_zb_zdo_signal_to_string(sig_type), esp_err_to_name(err_status), err_status);
         if (err_status == ESP_OK) {
-           set_led(2, 0, 10, 0, false);
+            set_led(2, 0, 10, 0, false);
             ESP_LOGI(TAG, "Joined Zigbee network successfully (PAN ID: 0x%04hx, Channel: %d, Short Address: 0x%04hx)",
                     esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
             // set_sensor_mode("external");  /* Activer le mode external au démarrage */
             read_thermostat_attributes();
             if (last_heating_setpoint != INT16_MIN) {
+                // Mettre la temp ext au setpoint
                 ESP_LOGI(TAG, "Applying setpoint from NVS: %.1f °C", last_heating_setpoint / 100.0);
                 set_external_temperature(last_heating_setpoint);
             }
@@ -532,11 +528,11 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             // send_hvac_on_command();
             // Activer la rangée centrale avec PMTSD
             // send_pmtsd_command(0, 1, (float)last_heating_setpoint / 100.0, 0, 1);
-            // Mettre la temp ext au setpoint
-            set_external_temperature(last_heating_setpoint);
             // Mettre l'humidité ext à 0 (provisoire)
             set_external_humidity(relay_actual_state == 1 ? 9900 : 0); // 99% si le relais est ON, sinon 0%
             zigbee_network_initialized = true;
+
+            //configure_device_reporting();
 
             esp_zb_zcl_read_attr_cmd_t read_cmd = {
                 .zcl_basic_cmd = {
@@ -804,11 +800,12 @@ static void configure_device_reporting(void)
 static void configure_relay_onoff_reporting(void)
 {
     // Préparer le record pour l'attribut OnOff
+    ESP_LOGI(TAG, "Configuration reporting relay");
     relay_report_record.direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND;  // Nous configurons le RELAIS pour qu'il nous envoie des rapports
     relay_report_record.attributeID = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID; // 0x0000
     relay_report_record.min_interval = 1;     // Min: 1 seconde
     relay_report_record.max_interval = 300;   // Max: 5 minutes
-    relay_report_record.reportable_change = (void*)1;  // Tout changement pour booléen
+    relay_report_record.reportable_change = (void*)0;  // Tout changement pour booléen
     relay_report_record.attrType = ESP_ZB_ZCL_ATTR_TYPE_BOOL;
 
     esp_zb_zcl_config_report_cmd_t report_cmd = {
@@ -845,9 +842,9 @@ static void configure_aqara_w100_reporting(void)
     // === 1. TEMPERATURE MEASUREMENT ===
     w100_temp_record.direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND;
     w100_temp_record.attributeID = ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID;
-    w100_temp_record.min_interval = 30;        // Min: 30 secondes
+    w100_temp_record.min_interval = 0;        // Min: 0 secondes
     w100_temp_record.max_interval = 300;       // Max: 5 minutes
-    w100_temp_record.reportable_change = (void*)50;  // Seuil: 0.5°C (50/100)
+    w100_temp_record.reportable_change = (void*)10;  // Seuil: 0.1°C (10/100)
     w100_temp_record.attrType = ESP_ZB_ZCL_ATTR_TYPE_S16;
 
     esp_zb_zcl_config_report_cmd_t temp_cmd = {
@@ -872,9 +869,9 @@ static void configure_aqara_w100_reporting(void)
     // === 2. HUMIDITY MEASUREMENT ===
     w100_hum_record.direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND;
     w100_hum_record.attributeID = ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID;
-    w100_hum_record.min_interval = 60;         // Min: 1 minute
-    w100_hum_record.max_interval = 600;        // Max: 10 minutes
-    w100_hum_record.reportable_change = (void*)50;   // Seuil: 0.5% (50/100)
+    w100_hum_record.min_interval = 0;
+    w100_hum_record.max_interval = 900;
+    w100_hum_record.reportable_change = (void*)100;
     w100_hum_record.attrType = ESP_ZB_ZCL_ATTR_TYPE_U16;
 
     esp_zb_zcl_config_report_cmd_t hum_cmd = {
@@ -900,17 +897,17 @@ static void configure_aqara_w100_reporting(void)
     // Attribut 0x0172 (mode/capteur)
     w100_lumi_records[0].direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND;
     w100_lumi_records[0].attributeID = 0x0172;
-    w100_lumi_records[0].min_interval = 300;   // Min: 5 minutes (peu de changements)
-    w100_lumi_records[0].max_interval = 3600;  // Max: 1 heure
-    w100_lumi_records[0].reportable_change = (void*)1;  // Tout changement (U8)
+    w100_lumi_records[0].min_interval = 0;
+    w100_lumi_records[0].max_interval = 300;
+    w100_lumi_records[0].reportable_change = (void*)0;  // Tout changement (U8)
     w100_lumi_records[0].attrType = ESP_ZB_ZCL_ATTR_TYPE_U8;
 
     // Attribut 0xFFF2 (données spécifiques)
     w100_lumi_records[1].direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND;
     w100_lumi_records[1].attributeID = 0xFFF2;
-    w100_lumi_records[1].min_interval = 30;    // Min: 30 secondes
-    w100_lumi_records[1].max_interval = 300;   // Max: 5 minutes
-    w100_lumi_records[1].reportable_change = (void*)1;  // Tout changement
+    w100_lumi_records[1].min_interval = 0;
+    w100_lumi_records[1].max_interval = 300;
+    w100_lumi_records[1].reportable_change = (void*)0;  // Tout changement
     w100_lumi_records[1].attrType = ESP_ZB_ZCL_ATTR_TYPE_U8;  // À confirmer selon doc Aqara
 
     esp_zb_zcl_config_report_cmd_t lumi_cmd = {
