@@ -79,6 +79,9 @@ static int16_t temp_value = 0;
 static int16_t heat_setpoint = 0;
 static int8_t running_state = 0;
 static uint8_t running_state_value = 0;
+static uint64_t temp_delay = 0;
+static uint64_t humidity_delay = 0;
+static uint64_t relay_delay = 0;
 
 // Variables globales volatiles (pour accès multi-tâches)
 volatile bool blink_enabled = false;
@@ -86,6 +89,9 @@ volatile uint8_t led_r = 0, led_g = 0, led_b = 0, led_nb = 0;
 
 /* Compteur global pour les headers Lumi */
 static uint8_t lumi_counter = 0x10;
+
+/* Compteur en secondes depuis démarrage */
+static uint64_t esp_counter = 0;
 
 // Handle global pour la LED strip
 static led_strip_handle_t led_strip;
@@ -932,6 +938,7 @@ static void configure_aqara_w100_reporting(void)
 
 static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_message_t *message) 
 { 
+    uint64_t delay;
     ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty message"); 
     ESP_RETURN_ON_FALSE(message->status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG, "Received message: error status(%d)", message->status);
     ESP_LOGI(TAG, "Received report from address(0x%04x) src endpoint(%d) to dst endpoint(%d) cluster(0x%04x)", 
@@ -943,16 +950,20 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
         if (message->cluster == ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID) {
                 last_temperature = *(int16_t *)message->attribute.data.value;
-                ESP_LOGI(TAG, "Thermostat 0x%04x Température: %d.%d °C", 
+                delay = temp_delay == 0 ? 0 : esp_counter - temp_delay;
+                temp_delay = esp_counter;
+                ESP_LOGI(TAG, "Thermostat 0x%04x Température: %d.%d °C (delay: %llu sec)", 
                          message->src_address.u.short_addr, 
-                         last_temperature / 100, abs(last_temperature % 100));
+                         last_temperature / 100, abs(last_temperature % 100), delay);
             }
         } else if (message->cluster == ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID) {
                 last_humidity = *(uint16_t *)message->attribute.data.value;
-                ESP_LOGI(TAG, "Thermostat 0x%04x Humidité: %d.%d %%", 
+                delay = humidity_delay == 0 ? 0 : esp_counter - humidity_delay;
+                humidity_delay = esp_counter;
+                ESP_LOGI(TAG, "Thermostat 0x%04x Humidité: %d.%d %% (delay: %llu sec)", 
                          message->src_address.u.short_addr, 
-                         last_humidity / 100, abs(last_humidity % 100));
+                         last_humidity / 100, abs(last_humidity % 100), delay);
             }
         } else if (message->cluster == 0xFCC0) { // manuSpecificLumi cluster
             ESP_LOGI(TAG, "Processing manuSpecificLumi attribute (0x%04x)", message->attribute.id);
@@ -1195,9 +1206,11 @@ static esp_err_t zb_attribute_reporting_handler(const esp_zb_zcl_report_attr_mes
         if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
             uint8_t relay_historical_state = relay_actual_state;
             relay_actual_state = (*(uint8_t *)message->attribute.data.value != 0) ? 1 : 0;
-            ESP_LOGI(TAG, "Relay 0x%04x On/Off state: %s", 
+            delay = relay_delay == 0 ? 0 : esp_counter - relay_delay;
+            relay_delay = esp_counter;
+            ESP_LOGI(TAG, "Relay 0x%04x On/Off state: %s (delay: %llu sec)", 
                      message->src_address.u.short_addr, 
-                     (relay_actual_state == 1) ? "ON" : "OFF");
+                     (relay_actual_state == 1) ? "ON" : "OFF", delay);
             if (relay_historical_state != relay_actual_state) {
                 ESP_LOGI(TAG, "Relay state changed from %s to %s",
                          (relay_historical_state == 1) ? "ON" : "OFF",
@@ -1537,21 +1550,21 @@ static esp_err_t get_handler(httpd_req_t *req)
     long file_size = ftell(f);
     rewind(f);
     ESP_LOGI(TAG, "Index.html size: %ld bytes", file_size);
-    if (file_size > 40000) {
-        ESP_LOGE(TAG, "Index.html too large (%" PRId32 " bytes), max is 40000 bytes", (int32_t)file_size);
+    if (file_size > 30000) {
+        ESP_LOGE(TAG, "Index.html too large (%" PRId32 " bytes), max is 30000 bytes", (int32_t)file_size);
         fclose(f);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
-    char *response = (char *)calloc(40000, 1);
+    char *response = (char *)calloc(30000, 1);
     if (response == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for response");
         fclose(f);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
-    char *updated_response = (char *)calloc(40000, 1);
+    char *updated_response = (char *)calloc(30000, 1);
     if (updated_response == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for updated_response");
         free(response);
@@ -1560,7 +1573,7 @@ static esp_err_t get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    size_t len = fread(response, 1, 40000, f);
+    size_t len = fread(response, 1, 30000, f);
     fclose(f);
     ESP_LOGI(TAG, "Read %u bytes from index.html", len);
 
@@ -1581,10 +1594,10 @@ static esp_err_t get_handler(httpd_req_t *req)
     snprintf(setpoint_str, sizeof(setpoint_str), "%.1f", last_heating_setpoint != INT16_MIN ? last_heating_setpoint / 100.0 : 0.0);
     snprintf(relay_str, sizeof(relay_str), "%s", last_command_sent == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID ? "ON" : "OFF");
 
-    int res_len = snprintf(updated_response, 40000,
+    int res_len = snprintf(updated_response, 30000,
                            response,
                            temp_str, humi_str, setpoint_str, relay_str, running_state_str, setpoint_str);
-    if (res_len >= 40000) {
+    if (res_len >= 30000) {
         ESP_LOGE(TAG, "Buffer overflow in get_handler, response truncated, res_len=%d", res_len);
         free(response);
         free(updated_response);
@@ -2000,47 +2013,35 @@ static esp_err_t data_handler(httpd_req_t *req)
     static uint16_t last_high_hyst_sent = 0;
     static uint16_t last_low_hyst_sent = 0;
     static char *last_update_status_sent = NULL;
+    static uint64_t temp_delay_calc = 0;
+    static uint64_t humidity_delay_calc = 0;
+    static uint64_t relay_delay_calc = 0;
 
-    bool data_changed = false;
+    temp_delay_calc = (esp_counter - temp_delay);
+    humidity_delay_calc = (esp_counter - humidity_delay);
+    relay_delay_calc = (esp_counter - relay_delay);
 
-    if (first_request || 
-        last_temperature_sent != last_temperature ||
-        last_humidity_sent != last_humidity ||
-        last_heating_setpoint_sent != last_heating_setpoint ||
-        last_relay_actual_state_sent != relay_actual_state ||
-        last_high_hyst_sent != input_high_hyst ||
-        last_low_hyst_sent != input_low_hyst ||
-        (update_status && !last_update_status_sent) ||
-        (!update_status && last_update_status_sent) ||
-        (update_status && last_update_status_sent && strcmp(update_status, last_update_status_sent) != 0)) {
-        data_changed = true;
-    }
-
-    if (!data_changed) {
-        ESP_LOGD(TAG, "No data change detected, skipping JSON response");
-        httpd_resp_set_status(req, "204 No Content");
-        httpd_resp_send(req, NULL, 0);
-        return ESP_OK;
-    }
-
-    char temp_str[16], humi_str[16], setpoint_str[16], relay_actual_str[16], relay_commanded_str[16], high_hyst_str[16], low_hyst_str[16];
+    char temp_str[16], temp_delay_str[16], humi_str[16], humi_delay_str[16], setpoint_str[16], relay_actual_str[16], relay_delay_str[16], relay_commanded_str[16], high_hyst_str[16], low_hyst_str[16];
     snprintf(temp_str, sizeof(temp_str), "%.1f", last_temperature != INT16_MIN ? last_temperature / 100.0 : 0.0);
+    snprintf(temp_delay_str, sizeof(temp_delay_str), "%lld", temp_delay_calc);
     snprintf(humi_str, sizeof(temp_str), "%.1f", last_humidity != INT16_MIN ? last_humidity / 100.0 : 0.0);
+    snprintf(humi_delay_str, sizeof(humi_delay_str), "%lld", humidity_delay_calc);
     snprintf(setpoint_str, sizeof(setpoint_str), "%.1f", last_heating_setpoint != INT16_MIN ? last_heating_setpoint / 100.0 : 0.0);
     snprintf(relay_actual_str, sizeof(relay_actual_str), "%s", (relay_actual_state != 0xFF) ? 
              ((relay_actual_state == 1) ? "ON" : "OFF") : "N/A");
+    sniprintf(relay_delay_str, sizeof(relay_delay_str), "%lld", relay_delay_calc);
     snprintf(relay_commanded_str, sizeof(relay_commanded_str), "%s", (last_command_sent != 0xFF) ? 
              ((last_command_sent == ESP_ZB_ZCL_CMD_ON_OFF_ON_ID) ? "ON" : "OFF") : "N/A");
     snprintf(high_hyst_str, sizeof(high_hyst_str), "%.1f", input_high_hyst / 100.0);
     snprintf(low_hyst_str, sizeof(low_hyst_str), "%.1f", input_low_hyst / 100.0);
 
     char *json_response = NULL;
-    int res_len = asprintf(&json_response, "{\"temperature\":\"%s\",\"humidity\":\"%s\",\"setpoint\":\"%s\",\"relay_actual\":\"%s\",\"relay_commanded\":\"%s\",\"high_hyst\":\"%s\",\"low_hyst\":\"%s\",\"update_status\":\"%s\"}",
-                           temp_str, humi_str, setpoint_str, relay_actual_str, relay_commanded_str, high_hyst_str, low_hyst_str, update_status ? update_status : "");
+    int res_len = asprintf(&json_response, "{\"temperature\":\"%s\",\"temp_delay\":\"%s\",\"humidity\":\"%s\",\"humidity_delay\":\"%s\",\"setpoint\":\"%s\",\"relay_actual\":\"%s\",\"relay_delay\":\"%s\",\"relay_commanded\":\"%s\",\"high_hyst\":\"%s\",\"low_hyst\":\"%s\",\"update_status\":\"%s\"}",
+                           temp_str, temp_delay_str, humi_str, humi_delay_str, setpoint_str, relay_actual_str, relay_delay_str, relay_commanded_str, high_hyst_str, low_hyst_str, update_status ? update_status : "");
     if (res_len < 0 || json_response == NULL) {
         ESP_LOGE(TAG, "Failed to allocate JSON response, sending default JSON");
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"error\":\"Failed to generate JSON\",\"temperature\":\"0.0\",\"humidity\":\"0.0\",\"setpoint\":\"0.0\",\"relay_actual\":\"N/A\",\"relay_commanded\":\"N/A\",\"high_hyst\":\"0.1\",\"low_hyst\":\"0.1\",\"update_status\":\"\"}", 139);
+        httpd_resp_send(req, "{\"error\":\"Failed to generate JSON\",\"temperature\":\"0.0\",\"temp_delay\":\"0.0\",\"humidity\":\"0.0\",\"humidity_delay\":\"0.0\",\"setpoint\":\"0.0\",\"relay_actual\":\"N/A\",\"relay_delay\":\"0.0\",\"relay_commanded\":\"N/A\",\"high_hyst\":\"0.1\",\"low_hyst\":\"0.1\",\"update_status\":\"\"}", 139);
         return ESP_OK;
     }
 
@@ -2081,7 +2082,7 @@ static esp_err_t status_handler(httpd_req_t *req)
 
 static esp_err_t operating_time_handler(httpd_req_t *req)
 {
-    char *res_car = operating_time ? operating_time : "0d 00h 00m";
+    char *res_car = operating_time ? operating_time : "0j 00h 00mn";
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, res_car, strlen(res_car));
@@ -3294,15 +3295,23 @@ void watchdog_task(void *pvParameters)
             int heures = (total_seconds % 86400) / 3600;
             int minutes = (total_seconds % 3600) / 60;
             watchdog_counter = 0;
-            //if (operating_time) free(operating_time);
+            free(operating_time);
             operating_time = malloc(32);
             if (operating_time) {
-                snprintf(operating_time, 32, "%dd %02dh %02dm", jours, heures, minutes);
+                snprintf(operating_time, 32, "%dj %02dh %02dmn", jours, heures, minutes);
             }
-            ESP_LOGW("WATCHDOG", "Je nourris le chien depuis %dj %02dh %02dm", jours, heures, minutes);
+            ESP_LOGW("WATCHDOG", "Je nourris le chien depuis %dj %02dh %02dmn", jours, heures, minutes);
         }
         esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+void counter_task(void *pvParameters)
+{
+    while (1) {
+        esp_counter++;
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Incrémente toutes les secondes
     }
 }
 
@@ -3326,4 +3335,5 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
     wifi_init();
     xTaskCreate(watchdog_task, "watchdog_task", 2048, NULL, 1, NULL);
+    xTaskCreate(counter_task, "counter_task", 2048, NULL, 1, NULL);
 }

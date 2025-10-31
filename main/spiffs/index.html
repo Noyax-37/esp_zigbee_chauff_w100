@@ -36,10 +36,27 @@
             <span id="errorMessageText"></span>
         </div>
         <div class="input-group">
-            <label for="temperature">Temperature:</label> <span id="temperature">N/A</span> °C
+            <label for="operating_time">Temps de fonctionnement :</label> <span id="operating_time"> 0j 00h 00mn </span>
         </div>
         <div class="input-group">
-            <label for="humidity">Humidité:</label> <span id="humidity">N/A</span>
+            <label for="temperature">Temperature:</label> <span id="temperature">N/A</span> °C reçu il y a <span id="temp_delay">(N/A)</span> s
+        </div>
+        <div class="input-group">
+            <label for="humidity">Humidité:</label> <span id="humidity">N/A</span> reçu il y a <span id="humidity_delay">(N/A)</span> s
+        </div>
+        <div class="input-group">
+            <label for="relay">Position Relais:</label> 
+            <span id="relay_actual">N/A</span>
+            <span id="relay_mismatch" style="display:none;">(Mismatch)</span>
+            reçu il y a <span id="relay_delay">(N/A)</span> s
+            <p>
+            <label>Commande Relais:</label> 
+            <span id="relay_commanded">N/A</span>
+            <span id="relay_mismatch" style="display:none;">(Mismatch)</span>
+            </p>
+            <p>État du chauffage :
+                <i id="relay_icon" class="fas fa-question-circle" style="color: orange; font-size: 2em; margin-left: 10px;"></i>
+            </p>
         </div>
         <div class="input-group">
             <label for="setpoint">Point de chauffe:</label> <span id="setpoint">N/A</span> °C
@@ -49,18 +66,6 @@
         </div>
         <div class="input-group">
             <label for="low_hyst">Hysteresis -:</label> <span id="low_hyst">N/A</span> °C
-        </div>
-        <div class="input-group">
-            <label>Commande Relais:</label> 
-            <span id="relay_commanded">N/A</span>
-            <span id="relay_mismatch" style="display:none;">(Mismatch)</span>
-            <p><label for="relay">Position Relais:</label> 
-            <span id="relay_actual">N/A</span>
-            <span id="relay_mismatch" style="display:none;">(Mismatch)</span>
-            </p>
-            <p>État du chauffage :
-                <i id="relay_icon" class="fas fa-question-circle" style="color: orange; font-size: 2em; margin-left: 10px;"></i>
-            </p>
         </div>
         <div id="update_status" style="color: blue;"></div>
         <div class="input-group">
@@ -113,9 +118,6 @@
             <label>Rangée Centrale (PMTSD):</label>
             <button onclick="sendPmtsd()">Envoyer PMTSD</button>
         </div>
-        <div class="input-group">
-            <label for="operating_time">Temps de fonctionnement :</label> <span id="operating_time"> 0j 00h 00mn </span>
-        </div>
 
 <script>
     let updateInterval = null;
@@ -132,11 +134,14 @@
                     if (text.trim() === '') return;
                     const data = JSON.parse(text);
                     document.getElementById('temperature').textContent = data.temperature !== undefined && data.temperature !== '0.0' ? data.temperature : 'N/A';
+                    document.getElementById('temp_delay').textContent = data.temp_delay !== undefined && data.temp_delay !== '0.0' ? data.temp_delay : 'N/A';
                     document.getElementById('humidity').textContent = data.humidity !== undefined && data.humidity !== '0.0' ? `${data.humidity} ${String.fromCharCode(0x0025)}` : 'N/A';
+                    document.getElementById('humidity_delay').textContent = data.humidity_delay !== undefined && data.humidity_delay !== '0.0' ? data.humidity_delay : 'N/A';
                     document.getElementById('setpoint').textContent = data.setpoint !== undefined && data.setpoint !== '0.0' ? data.setpoint : 'N/A';
                     document.getElementById('high_hyst').textContent = data.high_hyst !== undefined && data.high_hyst !== '0.0' ? data.high_hyst : 'N/A';
                     document.getElementById('low_hyst').textContent = data.low_hyst !== undefined && data.low_hyst !== '0.0' ? data.low_hyst : 'N/A';
-                    document.getElementById('relay_actual').textContent = data.relay_actual || 'N/A';
+                    document.getElementById('relay_actual').textContent = data.relay_actual || 'N/A ';
+                    document.getElementById('relay_delay').textContent = data.relay_delay !== undefined && data.relay_delay !== '0.0' ? data.relay_delay : 'N/A';
                     document.getElementById('relay_commanded').textContent = data.relay_commanded || 'N/A';
                     document.getElementById('update_status').textContent = data.update_status || '';
 
@@ -191,11 +196,14 @@
             try {
                 const data = JSON.parse(text);
                 document.getElementById('temperature').textContent = data.temperature !== undefined && data.temperature !== '0.0' ? data.temperature : 'N/A';
+                document.getElementById('temp_delay').textContent = data.temp_delay !== undefined && data.temp_delay !== '0.0' ? data.temp_delay : 'N/A';
                 document.getElementById('humidity').textContent = data.humidity !== undefined && data.humidity !== '0.0' ? `${data.humidity} ${String.fromCharCode(0x0025)}` : 'N/A';
+                document.getElementById('humidity_delay').textContent = data.humidity_delay !== undefined && data.humidity_delay !== '0.0' ? data.humidity_delay : 'N/A';
                 document.getElementById('setpoint').textContent = data.setpoint !== undefined && data.setpoint !== '0.0' ? data.setpoint : 'N/A';
                 document.getElementById('high_hyst').textContent = data.high_hyst !== undefined && data.high_hyst !== '0.0' ? data.high_hyst : 'N/A';
                 document.getElementById('low_hyst').textContent = data.low_hyst !== undefined && data.low_hyst !== '0.0' ? data.low_hyst : 'N/A';
-                document.getElementById('relay_actual').textContent = data.relay_actual || 'N/A';
+                document.getElementById('relay_actual').textContent = data.relay_actual || 'N/A ';
+                document.getElementById('relay_delay').textContent = data.relay_delay !== undefined && data.relay_delay !== '0.0' ? data.relay_delay : 'N/A';
                 document.getElementById('relay_commanded').textContent = data.relay_commanded || 'N/A';
                 document.getElementById('update_status').textContent = data.update_status || '';
 
