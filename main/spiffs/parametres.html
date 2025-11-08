@@ -16,6 +16,7 @@
 </head>
 <body>
     <h1>Paramètres</h1>
+    <h3>Zigbee:</h3>
     <form id="configForm">
         <div class="input-group">
             <label>Mode de fonctionnement :</label>
@@ -37,6 +38,16 @@
         <div class="input-group short-addresses">
             <label for="shortAddrRelay">Adresse courte du Relais (ex: 0x2c3d):</label>
             <input type="text" id="shortAddrRelay" name="shortAddrRelay" pattern="^0x[0-9a-fA-F]{4}$" required>
+        </div>
+        <div class="input-group delay">
+            <h3>Temps en secondes des reporting paramétrés (permet de vérifier si le reporting se fait bien):</h3>
+            <p></p>
+            <label for="w100_delay_param">     température du W100: </label>
+            <input type="text" id="w100_delay_param" name="w100_delay_param" pattern="[0-9]{4}$" required> s
+            <p></p>
+            <label for="relay_delay_param">     relais: </label>
+            <input type="text" id="relay_delay_param" name="relay_delay_param" pattern="[0-9]{4}$" required> s
+            <p></p>
         </div>
         <button type="button" class="button" onclick="saveConfig()">Sauvegarder</button>
         <button type="button" class="button" onclick="cancelConfig()">Annuler</button>
@@ -61,39 +72,11 @@
                     if (data.ieeeAddrRelay) document.getElementById('ieeeAddrRelay').value = data.ieeeAddrRelay;
                     if (data.shortAddrW100) document.getElementById('shortAddrW100').value = data.shortAddrW100;
                     if (data.shortAddrRelay) document.getElementById('shortAddrRelay').value = data.shortAddrRelay;
-
-                    // Mettre à jour l'affichage en fonction du mode
-                    updateFieldVisibility();
+                    if (data.w100_delay_param) document.getElementById('w100_delay_param').value = data.w100_delay_param;
+                    if (data.relay_delay_param) document.getElementById('relay_delay_param').value = data.relay_delay_param;
                 })
                 .catch(error => console.error('Error loading config:', error));
-
-            // Écouter les changements de mode
-            document.querySelectorAll('input[name="mode"]').forEach(radio => {
-                radio.addEventListener('change', updateFieldVisibility);
-            });
         };
-
-        function updateFieldVisibility() {
-            const isRouter = document.querySelector('input[name="mode"]:checked').value === 'router';
-            const shortAddressGroups = document.querySelectorAll('.short-addresses');
-            const longAddressGroups = document.querySelectorAll('.long-adresses');
-            shortAddressGroups.forEach(group => {
-                group.classList.toggle('hidden', !isRouter);
-                const inputs = group.querySelectorAll('input');
-                inputs.forEach(input => {
-                    input.disabled = !isRouter;
-                    input.classList.toggle('disabled', !isRouter);
-                });
-            });
-            longAddressGroups.forEach(group => {
-                group.classList.toggle('hidden', isRouter);
-                const inputs = group.querySelectorAll('input');
-                inputs.forEach(input => {
-                    input.disabled = isRouter;
-                    input.classList.toggle('disabled', isRouter);
-                });
-            });
-        }
 
         function saveConfig() {
             const mode = document.querySelector('input[name="mode"]:checked').value;
@@ -101,23 +84,22 @@
             const ieeeAddrRelay = document.getElementById('ieeeAddrRelay').value;
             const shortAddrW100 = document.getElementById('shortAddrW100').value;
             const shortAddrRelay = document.getElementById('shortAddrRelay').value;
+            const w100_delay_param = document.getElementById('w100_delay_param').value;
+            const relay_delay_param = document.getElementById('relay_delay_param').value;
 
-            if (!ieeeAddrW100.match(/^0x[0-9a-fA-F]{16}$/)) {
-                alert("Veuillez entrer une adresse IEEE valide pour le W100.");
+            if (!shortAddrW100.match(/^0x[0-9a-fA-F]{4}$/) || !shortAddrRelay.match(/^0x[0-9a-fA-F]{4}$/) || !ieeeAddrRelay.match(/^0x[0-9a-fA-F]{16}$/) || !ieeeAddrW100.match(/^0x[0-9a-fA-F]{16}$/)) {
+                alert("Veuillez entrer des adresses valides pour Zigbee.");
                 return;
             }
-            if (mode === 'router' && (!shortAddrW100.match(/^0x[0-9a-fA-F]{4}$/) || !shortAddrRelay.match(/^0x[0-9a-fA-F]{4}$/))) {
-                alert("Veuillez entrer des adresses courtes valides pour le mode Routeur.");
-                return;
-            } else if (mode === 'coordinator' && !ieeeAddrRelay.match(/^0x[0-9a-fA-F]{16}$/)) {
-                alert("Veuillez entrer une adresse IEEE valide pour le Relais.");
+            if (!w100_delay_param.match(/^[0-9]{1,4}$/) || !relay_delay_param.match(/^[0-9]{1,4}$/)) {
+                alert("Veuillez entrer des délais valides (jusqu'à 4 chiffres).");
                 return;
             }
 
             fetch('/saveConfig', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mode, ieeeAddrW100, ieeeAddrRelay, shortAddrW100, shortAddrRelay })
+                body: JSON.stringify({ mode, ieeeAddrW100, ieeeAddrRelay, shortAddrW100, shortAddrRelay, w100_delay_param, relay_delay_param })
             })
             .then(response => {
                 if (response.ok) {

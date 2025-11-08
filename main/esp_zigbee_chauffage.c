@@ -68,6 +68,8 @@ static char ieee_addr_relay[20] = {0}; // Buffer pour "0x" + 16 caractères + \0
 static char short_addr_w100[10] = {0}; // Buffer pour "0x" + 4 caractères + \0
 static char short_addr_relay[10] = {0}; // Buffer pour "0x" + 4 caractères + \0
 static char mode_rout_coord[20] = {0}; // Buffer pour "router" ou "coordinator"
+static char w100_delay_param[4] = {0}; // Buffer pour délai W100
+static char relay_delay_param[4] = {0}; // Buffer pour délai relais
 static uint8_t ieee_addr_w100_bytes[8] = {0};
 static uint8_t ieee_addr_relay_bytes[8] = {0};
 static uint16_t short_addr_w100_value = 0;
@@ -365,6 +367,8 @@ static void save_settings_to_nvs(void) {
     set_led(0, 0, 0, 10, blink);
     ESP_LOGI(TAG, "Settings saved to NVS: setpoint=%d, high_hyst=%u, low_hyst=%u", 
              last_heating_setpoint, input_high_hyst, input_low_hyst);
+
+    load_settings_from_nvs(); // Vérification en relisant les paramètres
 }
 
 static void load_settings_from_nvs(void) {
@@ -384,6 +388,8 @@ static void load_settings_from_nvs(void) {
         strcpy(short_addr_w100, "");
         strcpy(short_addr_relay, "");
         strcpy(mode_rout_coord, "router"); // Default mode
+        strcpy(w100_delay_param, "300"); // Default delay
+        strcpy(relay_delay_param, "900"); // Default delay
         return;
     }
 
@@ -488,14 +494,32 @@ static void load_settings_from_nvs(void) {
         strcpy(mode_rout_coord, "router");
     }
 
+    len = sizeof(w100_delay_param);
+    err = nvs_get_str(nvs_handle, "w100Delay", w100_delay_param, &len);
+    if (err != ESP_OK) {
+        blink = true;
+        ESP_LOGW(TAG, "Failed to read w100Delay: %s, using default '300'", esp_err_to_name(err));
+        strcpy(w100_delay_param, "300");
+    }
+
+    len = sizeof(relay_delay_param);
+    err = nvs_get_str(nvs_handle, "relayDelay", relay_delay_param, &len);
+    if (err != ESP_OK) {
+        blink = true;
+        ESP_LOGW(TAG, "Failed to read relayDelay: %s, using default '900'", esp_err_to_name(err));
+        strcpy(relay_delay_param, "900");
+    }
+
     nvs_close(nvs_handle);
 
     set_led(0, 0, 0, 10, blink);
 
     ESP_LOGI(TAG, "Settings loaded from NVS: setpoint=%d, high_hyst=%u, low_hyst=%u, "
-             "mode=%s, ieee_addr_w100=%s, ieee_addr_relay=%s, short_addr_w100=%s, short_addr_relay=%s",
+             "mode=%s, ieee_addr_w100=%s, ieee_addr_relay=%s, short_addr_w100=%s, short_addr_relay=%s, "
+             "w100_delay_param=%s, relay_delay_param=%s",
              last_heating_setpoint, input_high_hyst, input_low_hyst,
-             mode_rout_coord, ieee_addr_w100, ieee_addr_relay, short_addr_w100, short_addr_relay);
+             mode_rout_coord, ieee_addr_w100, ieee_addr_relay, short_addr_w100, short_addr_relay,
+             w100_delay_param, relay_delay_param);
 }
 
 static void bdb_start_top_level_commissioning_wrapper(uint8_t mode_mask)
@@ -1683,8 +1707,10 @@ static esp_err_t save_config_handler(httpd_req_t *req) {
     cJSON *ieeeAddrRelay = cJSON_GetObjectItem(json, "ieeeAddrRelay");
     cJSON *shortAddrW100 = cJSON_GetObjectItem(json, "shortAddrW100");
     cJSON *shortAddrRelay = cJSON_GetObjectItem(json, "shortAddrRelay");
+    cJSON *w100_delay_param = cJSON_GetObjectItem(json, "w100_delay_param");
+    cJSON *relay_delay_param = cJSON_GetObjectItem(json, "relay_delay_param");
 
-    if (mode_rout_coord && ieeeAddrW100 && ieeeAddrRelay) {
+    if (mode_rout_coord && ieeeAddrW100 && ieeeAddrRelay && shortAddrRelay && shortAddrW100 && w100_delay_param && relay_delay_param) {
         nvs_handle_t nvs_handle;
         esp_err_t err;
         if (nvs_open("storage", NVS_READWRITE, &nvs_handle) == ESP_OK) {
@@ -1719,16 +1745,25 @@ static esp_err_t save_config_handler(httpd_req_t *req) {
                 else ESP_LOGI(TAG, "Short Relay address set: %s", shortAddrRelay->valuestring);
             }
 
+            err = nvs_set_str(nvs_handle, "w100Delay", w100_delay_param->valuestring);
+            if (err != ESP_OK) ESP_LOGE(TAG, "Failed to set w100 delay in NVS: %s", esp_err_to_name(err));
+            else ESP_LOGI(TAG, "Mode set: %s", w100_delay_param->valuestring);
+
+            err = nvs_set_str(nvs_handle, "relayDelay", relay_delay_param->valuestring);
+            if (err != ESP_OK) ESP_LOGE(TAG, "Failed to set relay delay in NVS: %s", esp_err_to_name(err));
+            else ESP_LOGI(TAG, "Mode set: %s", relay_delay_param->valuestring);
+
             err = nvs_commit(nvs_handle);
             if (err != ESP_OK) ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
             else ESP_LOGI(TAG, "NVS commit successful");
 
             nvs_close(nvs_handle);
 
-            ESP_LOGI(TAG, "Config saved: Mode=%s, IEEE W100=%s, IEEE Relay=%s, Short W100=%s, Short Relay=%s",
+            ESP_LOGI(TAG, "Config saved: Mode=%s, IEEE W100=%s, IEEE Relay=%s, Short W100=%s, Short Relay=%s, W100 Delay=%s, Relay Delay=%s",
                      mode_rout_coord->valuestring, ieeeAddrW100->valuestring, ieeeAddrRelay->valuestring,
                      shortAddrW100 ? shortAddrW100->valuestring : "N/A",
-                     shortAddrRelay ? shortAddrRelay->valuestring : "N/A");
+                     shortAddrRelay ? shortAddrRelay->valuestring : "N/A",
+                     w100_delay_param->valuestring, relay_delay_param->valuestring);
 
             httpd_resp_sendstr(req, "{\"status\":\"success\"}");
 
@@ -1739,8 +1774,9 @@ static esp_err_t save_config_handler(httpd_req_t *req) {
                 // vTaskDelay(pdMS_TO_TICKS(2000));
                 // esp_restart();
             } else {
-                ESP_LOGI(TAG, "No mode change, no restart needed");
+                ESP_LOGI(TAG, "No mode change");
             }
+            load_settings_from_nvs(); // Vérification en relisant les paramètres
         } else {
             ESP_LOGE(TAG, "Failed to open NVS");
             httpd_resp_sendstr(req, "{\"status\":\"error\"}");
@@ -1763,6 +1799,8 @@ static esp_err_t get_config_handler(httpd_req_t *req) {
     char ieee_addr_relay[20] = {0};
     char short_addr_w100[10] = {0};
     char short_addr_relay[10] = {0};
+    char w100_delay_param[4] = {0};
+    char relay_delay_param[4] = {0};
     size_t len;
 
     esp_err_t err = nvs_open("storage", NVS_READONLY, &nvs_handle);
@@ -1817,6 +1855,24 @@ static esp_err_t get_config_handler(httpd_req_t *req) {
         ESP_LOGI(TAG, "Loaded short_ad_relay from NVS: %s (len=%zu)", short_addr_relay, len);
     }
 
+    len = sizeof(w100_delay_param);
+    err = nvs_get_str(nvs_handle, "w100Delay", w100_delay_param, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "w100Delay not found in NVS");
+        strcpy(w100_delay_param, "300");
+    } else {
+        ESP_LOGI(TAG, "Loaded w100Delay from NVS: %s (len=%zu)", w100_delay_param, len);
+    }
+
+    len = sizeof(relay_delay_param);
+    err = nvs_get_str(nvs_handle, "relayDelay", relay_delay_param, &len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "relayDelay not found in NVS");
+        strcpy(relay_delay_param, "900");
+    } else {
+        ESP_LOGI(TAG, "Loaded relayDelay from NVS: %s (len=%zu)", relay_delay_param, len);
+    }
+
     nvs_close(nvs_handle);
 
     cJSON *json = cJSON_CreateObject();
@@ -1831,6 +1887,8 @@ static esp_err_t get_config_handler(httpd_req_t *req) {
     cJSON_AddStringToObject(json, "ieeeAddrRelay", ieee_addr_relay);
     cJSON_AddStringToObject(json, "shortAddrW100", short_addr_w100);
     cJSON_AddStringToObject(json, "shortAddrRelay", short_addr_relay);
+    cJSON_AddStringToObject(json, "w100_delay_param", w100_delay_param);
+    cJSON_AddStringToObject(json, "relay_delay_param", relay_delay_param);
 
     char *json_str = cJSON_Print(json);
     if (json_str == NULL) {
@@ -2020,6 +2078,21 @@ static esp_err_t data_handler(httpd_req_t *req)
     temp_delay_calc = (esp_counter - temp_delay);
     humidity_delay_calc = (esp_counter - humidity_delay);
     relay_delay_calc = (esp_counter - relay_delay);
+
+    char *endptr;                  // Pour vérifier les erreurs
+    long value = strtol(w100_delay_param, &endptr, 10);  // Base 10
+
+    if (temp_delay_calc > ((value) * 1.1)) {
+        update_status = "Attention: délais dépassés pour remontée de température du W100";
+        update_status_allocated = false;
+    }
+
+    value = strtol(relay_delay_param, &endptr, 10);  // Base 10
+
+    if (relay_delay_calc > ((value) * 1.1)) {
+        update_status = "Attention: délais dépassés pour remontée d'état du relais";
+        update_status_allocated = false;
+    }
 
     char temp_str[16], temp_delay_str[16], humi_str[16], humi_delay_str[16], setpoint_str[16], relay_actual_str[16], relay_delay_str[16], relay_commanded_str[16], high_hyst_str[16], low_hyst_str[16];
     snprintf(temp_str, sizeof(temp_str), "%.1f", last_temperature != INT16_MIN ? last_temperature / 100.0 : 0.0);
